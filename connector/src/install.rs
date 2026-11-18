@@ -175,6 +175,7 @@ const OWNED: &[&str] = &[
     "agents.lock",
     "connector-crash-id.json",
     "connector-crashes",
+    "connector-handled-errors.json",
     "connector.json",
     "connector.lock",
     "connector.log",
@@ -2118,6 +2119,8 @@ pub(crate) mod tests {
         fs::create_dir_all(&crashes).unwrap();
         fs::write(crashes.join("crash-x.json"), "{}").unwrap();
         fs::write(layout.data.join("connector-crash-id.json"), "{}").unwrap();
+        // And the day's list of handled errors it sent (`crash::handled`).
+        fs::write(layout.data.join("connector-handled-errors.json"), "{}").unwrap();
         crate::lock::try_lock(&layout.data.join("agents.lock"), "test").unwrap();
         // The shared models are another program's: if they are in `D` (un-overridden), they and what is in them survive.
         let models = layout.data.join(data_dir::MODELS).join("other-program");

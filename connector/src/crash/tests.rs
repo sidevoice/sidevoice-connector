@@ -12,6 +12,8 @@ use crate::platform::fs::{Files, Fs};
 use crate::profile::Profile;
 use crate::test_support::temp_dir;
 
+mod handled;
+
 const ID: &str = "7b2f0b00-1c3e-4d5a-8f6b-0123456789ab";
 
 fn at(days_ago: i64) -> String {
@@ -87,6 +89,7 @@ fn context(f: &Fixture) -> Context {
         store: CrashStore::new(&f.data, Vec::new()),
         homes: Vec::new(),
         os: "linux",
+        os_name: "Linux",
         arch: "amd64",
         images: Vec::new(),
         redact: str::to_owned,
@@ -1401,6 +1404,7 @@ async fn the_command_forwards_to_the_core_and_off_erases_the_connectors_own() {
     let store = CrashStore::new(&data, Vec::new());
     store.record(record(1)).unwrap();
     settings::machine_id(&data).unwrap();
+    fs::write(data.join("connector-handled-errors.json"), b"{}").unwrap();
 
     assert!(forward(&core.profile, None).await.unwrap());
     assert!(forward(&core.profile, Some(true)).await.unwrap());
@@ -1421,6 +1425,10 @@ async fn the_command_forwards_to_the_core_and_off_erases_the_connectors_own() {
     );
     assert!(store.pending().unwrap().is_empty());
     assert!(!data.join("connector-crash-id.json").exists());
+    assert!(
+        !data.join("connector-handled-errors.json").exists(),
+        "the day's list of handled errors goes with them"
+    );
     assert!(
         !forward(&core.profile, None).await.unwrap(),
         "the core says it"

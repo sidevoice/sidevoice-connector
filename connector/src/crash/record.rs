@@ -238,13 +238,7 @@ impl CrashRecord {
         if self.exception.message != FORMATTED_MARKER {
             self.exception.len = None;
         }
-        let file = clean(&self.location.file, MAX_TEXT).replace('\\', "/");
-        let relative = !file.starts_with('/')
-            && file.split('/').all(|part| part != ".." && !part.is_empty())
-            && file
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "_./-".contains(c));
-        self.location.file = if relative { file } else { "unknown".to_owned() };
+        self.location.file = relative_path(&self.location.file);
         self.backtrace = self
             .backtrace
             .iter()
@@ -343,6 +337,22 @@ fn image(image: &Image) -> Option<Image> {
             .clone()
             .filter(|id| token(id, 128, |c| c.is_ascii_hexdigit())),
     })
+}
+
+/// A source path as a report may carry it: short, relative, of plain characters; anything else (an absolute path, a home, a
+/// drive) is `unknown`.
+pub(super) fn relative_path(path: &str) -> String {
+    let file = clean(path, MAX_TEXT).replace('\\', "/");
+    let relative = !file.starts_with('/')
+        && file.split('/').all(|part| part != ".." && !part.is_empty())
+        && file
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_./-".contains(c));
+    if relative {
+        file
+    } else {
+        "unknown".to_owned()
+    }
 }
 
 /// `text` with control characters as spaces and invisible format characters (bidi controls among them) removed, cut to

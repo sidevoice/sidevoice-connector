@@ -76,6 +76,7 @@ pub fn init(file: PathBuf, service: bool, home: &Path) {
             data,
             homes.clone(),
             resource.os_type,
+            resource.os_name,
             resource.host_arch,
             redact,
         );
@@ -171,6 +172,7 @@ pub fn install(default: &str) {
     if tracing_subscriber::registry()
         .with(layer)
         .with(crate::crash::tail_layer(in_panic_hook))
+        .with(crate::crash::handled_layer(in_panic_hook))
         .try_init()
         .is_err()
     {
