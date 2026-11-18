@@ -80,6 +80,7 @@
   "start.failed": "The core could not start ({detail}).",
   "connector.failed": "Sidevoice could not complete the command: {detail}",
   "connector.usage": "Unknown or incomplete command: {detail}",
+  "crash-reports.core-unavailable": "The Sidevoice core did not answer, so the crash report setting was not read or changed. Start Sidevoice and try again; a core older than the release that added this setting does not have it.",
   "pair-device.failed": "No pairing code could be had from this machine's core: {detail}",
   "core.package-missing": "This Sidevoice package does not carry a core for this computer ({detail}). Install Sidevoice again.",
   "core.package-mismatch": "The core in this Sidevoice package is not the one the package lists ({detail}); nothing was installed. Install Sidevoice again.",

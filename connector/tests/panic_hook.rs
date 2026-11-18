@@ -17,6 +17,14 @@ const LITERAL: &str = "literal words that may be logged";
 fn child(dir: &Path, service: bool) {
     logfile::install("info");
     logfile::init(dir.join("connector.log"), service, Path::new(CANARY_HOME));
+    // A warning of ours before the panics: the record's tail keeps it, with the home hidden and its id re-keyed.
+    tracing::warn!(
+        target: "sidevoice_connector::canary",
+        conversation = "h:0123456789ab",
+        path = "/home/canary-user-7f3a/project",
+        "something of ours went wrong"
+    );
+    tracing::info!(target: "sidevoice_connector::canary", "too quiet for a record's tail");
     let literal = std::thread::Builder::new()
         .name("literal-panic".into())
         .spawn(|| panic!("literal words that may be logged"))
@@ -116,10 +124,11 @@ fn a_panic_is_two_redacted_events_and_the_backtrace_reaches_the_file_only() {
         }
     }
 
-    // Each panic left one record in the core's spool: the closed fields, the literal or the marker, nothing of the canary.
-    let spool = scratch.path().join("crash-inbox");
+    // Each panic left one crash record, to be sent at the next start (`D/connector-crashes`): the closed fields, the literal
+    // or the marker, nothing of the canary, the tail with only our own warnings and never the panic itself.
+    let records = scratch.path().join("connector-crashes");
     let mut messages = Vec::new();
-    for entry in fs::read_dir(&spool).expect("the spool") {
+    for entry in fs::read_dir(&records).expect("the crash records") {
         let text = fs::read_to_string(entry.unwrap().path()).unwrap();
         for forbidden in ["canary-secret-7f3a", "canary-user-7f3a"] {
             assert!(
@@ -128,14 +137,63 @@ fn a_panic_is_two_redacted_events_and_the_backtrace_reaches_the_file_only() {
             );
         }
         let record: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(record["piece"], "connector");
+        let mut keys: Vec<&str> = record
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "arch",
+                "backtrace",
+                "count",
+                "exception",
+                "first_at",
+                "id",
+                "images",
+                "last_at",
+                "location",
+                "log_tail",
+                "os",
+                "signature",
+                "version"
+            ],
+            "the closed field list"
+        );
+        assert_eq!(record["version"], env!("SIDEVOICE_CONNECTOR_VERSION"));
         assert!(record["location"]["line"].as_u64().unwrap() > 0);
         assert!(!record["backtrace"].as_array().unwrap().is_empty());
-        assert!(record["log_tail"].to_string().contains(" panic: "));
+        assert!(record["backtrace"][0]["addr"].as_u64().unwrap() > 0);
+        let tail: Vec<&str> = record["log_tail"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|line| line.as_str())
+            .collect();
+        let tail = tail.join("\n");
+        assert!(
+            tail.contains("something of ours went wrong")
+                && tail.contains("conversation=v1")
+                && tail.contains("path=\"~/project\""),
+            "{tail}"
+        );
+        assert!(
+            !tail.contains("panic:") && !tail.contains("too quiet"),
+            "the panic itself is the record, not its tail: {tail}"
+        );
         messages.push(record["exception"]["message"].as_str().unwrap().to_owned());
     }
     messages.sort();
     assert_eq!(messages, ["<formatted panic message omitted>", LITERAL]);
+    assert!(
+        !scratch.path().join("crash-inbox").exists(),
+        "nothing is left for anyone else to relay"
+    );
+    // Nothing was asked of a core or sent: this build has no DSN, and no id was made.
+    assert!(!scratch.path().join("connector-crash-id.json").exists());
 }
 
 const SERVICE_TEST: &str = "a_service_panic_reaches_the_file_and_not_stderr";
@@ -188,6 +246,10 @@ fn a_panic_before_the_file_sink_is_stderr_only_with_no_backtrace() {
             .unwrap();
         assert!(panicked.join().is_err());
         assert!(!Path::new(&dir).join("connector.log").exists());
+        assert!(
+            !Path::new(&dir).join("connector-crashes").exists(),
+            "no file sink, no crash record"
+        );
         return;
     }
     let scratch = tempfile::tempdir().unwrap();

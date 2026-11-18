@@ -86,6 +86,9 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
     let supervisor = Arc::new(crate::service::core_supervisor(&profile));
     let link_task = tokio::spawn(link.run(profile.clone(), incoming_tx, ready_tx, supervisor));
     drop(ready_rx);
+    // Once the connector listens: the crash reports a previous run left are sent in the background, when the core, which
+    // owns the setting, says this machine sends them (`crate::crash`).
+    crate::crash::start(profile.clone());
     let scanner = if managed {
         let host_agents = daemon.host_agents.clone();
         let scan_profile = profile.clone();
