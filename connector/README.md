@@ -365,11 +365,11 @@ architecture and the connector's random id; the event's message and fields are n
 name or breadcrumb can go with it. An event without a code of that list is only counted in memory. At most one event per
 error code per day (UTC) and install, and at most 64 codes a day; the day's list is `D/connector-handled-errors.json`
 (private; `uninstall` removes it). They are sent in the background, one at a time, by a thread of its own, with the same
-timeouts as a crash report; after a failed send, or a core that did not answer, none is tried for ten minutes. **The core
-decides, as for the crash reports:** an error is queued only while the core's last answer was "on" (the answer the daemon
-already keeps and asks again every ten minutes and whenever the link is made again), the sender asks the core before each send
-and once more after the id and the list exist, and a core that cannot be asked, or has not answered yet, sends and queues
-nothing. **Off** erases that list with the id and the records. A build with no DSN does not even watch for them.
+timeouts as a crash report; after a failed send none is tried for ten minutes. **The core
+decides, as for the crash reports:** an error is queued (in a bounded in-memory queue, with the time it happened) unless the
+core's last answer, which the daemon already keeps and asks again every ten minutes and whenever the link is made again, is
+"off"; the sender asks the core before each send and once more after the id and the list exist: "on" sends, and a core that
+cannot be asked sends nothing and keeps the errors waiting, to ask again in 30 seconds. **Off** erases that list with the id and the records. A build with no DSN does not even watch for them.
 
 ## Conversation flow
 
