@@ -267,6 +267,8 @@ pub struct HostAgents {
     stopping: Arc<AtomicBool>,
     /// The installer's own requests (`install`, `uninstall`): a person's stop does not hold them back.
     installer: bool,
+    /// How long one request may take in all, scans and registrations included; tests widen it.
+    request_limit: StdDuration,
 }
 
 #[derive(Debug)]
@@ -323,6 +325,7 @@ impl HostAgents {
             operations: Arc::new(Mutex::new(Vec::new())),
             stopping: Arc::new(AtomicBool::new(false)),
             installer: false,
+            request_limit: REQUEST_LIMIT,
         })
     }
 
@@ -346,13 +349,18 @@ impl HostAgents {
 
     #[cfg(test)]
     fn with_selected(profile: Profile, selected: InstalledCommand) -> Arc<Self> {
-        Self::with_command(profile, selected)
+        // The limit is the product's answer time for a person, not something these tests check: a machine busy with
+        // the rest of the suite (every stand-in is a whole test binary starting up) must not turn a slow request into
+        // `agents.busy`.
+        let mut agents = Arc::unwrap_or_clone(Self::with_command(profile, selected));
+        agents.request_limit = StdDuration::from_secs(600);
+        Arc::new(agents)
     }
 
     pub async fn handle(self: &Arc<Self>, method: &str, params: Value) -> Value {
         let cancel = Cancellation::new();
         let _cancel_on_drop = CancelOnDrop(Some(cancel.clone()));
-        let deadline = Instant::now() + REQUEST_LIMIT;
+        let deadline = Instant::now() + self.request_limit;
         let this = self.clone();
         let method = method.to_owned();
         let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
