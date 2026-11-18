@@ -80,6 +80,39 @@ pub async fn health(endpoint: &Endpoint, limit: Duration) -> Result<Value> {
     Ok(serde_json::from_str(payload)?)
 }
 
+/// The machine's "send crash reports" setting, which the core owns: `GET /api/local/crash-reports` on its local endpoint,
+/// within `limit`. A core that has no such endpoint answers 404, which is an error here, never "off".
+pub async fn crash_reports(endpoint: &Endpoint, limit: Duration) -> Result<bool> {
+    let get =
+        "GET /api/local/crash-reports HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    crash_reports_answer(&request(endpoint, get.to_owned(), limit).await?)
+}
+
+/// Sets it: `PUT /api/local/crash-reports` with `{"send": bool}`; the core answers what it now is. Turning it off erases the
+/// core's own id and records.
+pub async fn set_crash_reports(endpoint: &Endpoint, send: bool, limit: Duration) -> Result<bool> {
+    let body = serde_json::json!({"send": send}).to_string();
+    let put = format!(
+        "PUT /api/local/crash-reports HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    crash_reports_answer(&request(endpoint, put, limit).await?)
+}
+
+/// The `send` of a 200 answer of the crash report endpoint.
+fn crash_reports_answer(response: &str) -> Result<bool> {
+    if !answered(response, 200) {
+        bail!("Core crash reports refused");
+    }
+    let (_, payload) = response
+        .split_once("\r\n\r\n")
+        .context("Core crash reports body missing")?;
+    serde_json::from_str::<Value>(payload)?
+        .get("send")
+        .and_then(Value::as_bool)
+        .context("Core crash reports answer malformed")
+}
+
 fn require_v3(ready: &Ready) -> Result<()> {
     if !ready
         .connector_protocols
@@ -121,11 +154,23 @@ impl Profile {
         let health = self.health_ready(&ready).await?;
         Ok((ready, health))
     }
+
+    /// Whether this machine sends crash reports, as the core running now says it (identified like its health).
+    pub async fn crash_reports(&self) -> Result<bool> {
+        let (ready, _) = self.health().await?;
+        crash_reports(&ready.endpoint, Duration::from_secs(2)).await
+    }
+
+    /// Sets it in the core running now, and returns what the core says it is.
+    pub async fn set_crash_reports(&self, send: bool) -> Result<bool> {
+        let (ready, _) = self.health().await?;
+        set_crash_reports(&ready.endpoint, send, Duration::from_secs(5)).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{read, require_v3};
+    use super::{crash_reports_answer, read, require_v3};
     use crate::platform::fs::{Files, Fs};
     use crate::platform::ipc::{Address, Endpoint};
 
@@ -145,6 +190,42 @@ mod tests {
         assert_eq!((read.pid, read.launch_id.as_str()), (42, "launch-1"));
         assert_eq!(read.connector_protocols, Some(vec![3, 4, 1000]));
         require_v3(&read).unwrap();
+    }
+
+    /// The core's answer about crash reports is read for its `send` alone: a newer core's extra fields, top level and nested,
+    /// are ignored, and anything that is not an answer with a boolean `send` is an error, never "off".
+    #[test]
+    fn the_crash_report_answer_is_read_for_its_send_and_nothing_else() {
+        let ok = |body: &str| {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        assert!(crash_reports_answer(&ok(r#"{"send":true}"#)).unwrap());
+        assert!(
+            !crash_reports_answer(&ok(r#"{"send":false,"since":{"nested":[1,2]},"x":null}"#))
+                .unwrap()
+        );
+        for body in [
+            "{}",
+            r#"{"send":"yes"}"#,
+            r#"{"send":null}"#,
+            "[true]",
+            "not json",
+            "",
+        ] {
+            assert!(crash_reports_answer(&ok(body)).is_err(), "{body}");
+        }
+        for status in [
+            "404 Not Found",
+            "400 Bad Request",
+            "500 Internal Server Error",
+        ] {
+            let refused =
+                format!("HTTP/1.1 {status}\r\nContent-Length: 13\r\n\r\n{{\"send\":true}}");
+            assert!(crash_reports_answer(&refused).is_err(), "{status}");
+        }
     }
 
     /// The ready file names the core's endpoint as its record; without a valid one it is refused.

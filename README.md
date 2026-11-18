@@ -96,6 +96,7 @@ English message.
 |---|---|
 | `install` | Installs this package's connector and the core it carries (or updates to them), starts both, checks they answer (or goes back to the previous version), then lists the agents it finds and how to connect each one. It connects none by itself; in a terminal it offers to (`--no-prompt` does not ask). An agent connected by an older Sidevoice is kept working. `--no-agents` leaves the agents alone. |
 | `uninstall` | The reverse of `install`: stops Sidevoice, removes its service jobs and the agent registrations it wrote, then what it installed and its data. Agent configuration it did not write is never edited. |
+| `crash-reports <on\|off\|status>` | Whether this machine sends crash reports. It is the core's setting (one for the machine, the desktop app's switch too), so the core must be running; the connector sends its own reports and asks the core before it does. Off also deletes the connector's pending reports. |
 | `pair-device` | Prints a one-time code (and its QR) that pairs a device with this machine. |
 | `agents` | The agents on this machine and whether they use Sidevoice; `agents connect\|disconnect\|dismiss <claude\|codex\|cursor>` changes one. |
 | `service <install\|start\|stop\|restart\|status\|uninstall>` | Sidevoice at login: the core and the connector as two jobs of launchd or the systemd user manager. Without a service manager, Sidevoice runs on demand. |

@@ -4,11 +4,14 @@
 //! the build machine's, so it runs on every distribution from that release on; the inventory records the floor and
 //! `verify` checks the binary needs nothing newer.
 
+use std::path::PathBuf;
 use std::process::Command;
 
 use serde_json::json;
+use sidevoice_platform::target::ReleaseTarget;
 
 use crate::archive::write_archive;
+use crate::debug_files;
 use crate::glibc;
 use crate::host::chmod;
 use crate::notices::stage_notices;
@@ -36,16 +39,12 @@ pub(crate) fn dist() -> Result<()> {
     let linux = release_target.os == "linux";
     // On Linux, cargo-zigbuild's `<triple>.<glibc>` target links against that glibc release; the binary lands in
     // target/<triple>/release.
-    let (subcommand, build_target, built) = if linux {
-        let built = repo.join("target").join(triple).join("release");
-        (
-            "zigbuild",
-            Some(format!("{triple}.{}", glibc::FLOOR)),
-            built,
-        )
+    let (subcommand, build_target) = if linux {
+        ("zigbuild", Some(format!("{triple}.{}", glibc::FLOOR)))
     } else {
-        ("build", None, repo.join("target/release"))
+        ("build", None)
     };
+    let built = built_dir(release_target);
     let mut build = Command::new(cargo());
     // Only the connector (and on Windows its windowless launcher): the test bench (testbench/) is a package of its own
     // and is not released.
@@ -87,6 +86,12 @@ pub(crate) fn dist() -> Result<()> {
         &read(&built.join(release_target.exe_name(PACKAGE)))?,
     )?;
     chmod(&binary, 0o755)?;
+    // The debug files go beside the archive (`target/dist/debug`, `cargo xtask sentry-upload`); the shipped binary carries none.
+    debug_files::split(
+        release_target,
+        &built.join(release_target.exe_name(PACKAGE)),
+        &binary,
+    )?;
     let mut executables = vec![entrypoint.clone()];
     if let Some(launcher) = background(target) {
         let staged = stage.join(&launcher);
@@ -134,4 +139,15 @@ pub(crate) fn dist() -> Result<()> {
                "size": bytes.len(), "sha256": sha256(&bytes), "files": count})
     );
     verify(&archive, None)
+}
+
+/// Where `dist` finds the release binary it built: on Linux below the target's triple, where `cargo zigbuild` puts what it
+/// builds for a glibc floor.
+fn built_dir(target: &ReleaseTarget) -> PathBuf {
+    let release = repo().join("target");
+    if target.os == "linux" {
+        release.join(target.triple).join("release")
+    } else {
+        release.join("release")
+    }
 }

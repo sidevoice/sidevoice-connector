@@ -26,6 +26,7 @@ The core exposes this as a boolean fact, and the web waits three seconds before 
 | `agents connect\|disconnect\|dismiss\|check <claude\|codex\|cursor> [--json]` | Registers Sidevoice with an agent, removes its registration, dismisses the new-agent notice, or checks that its registration works (below). Only an entry Sidevoice wrote is ever changed. |
 | `service <install\|start\|stop\|restart\|status\|uninstall> [--json]` | The login service: two jobs under launchd, the systemd user manager or Task Scheduler; with no manager, Sidevoice on demand (below; on Windows the core runs only as its task). |
 | `service login <on\|off\|status> [--json]` | Whether the login service starts at the next login, and only that: turning it off stops nothing, turning it on starts nothing (below). |
+| `crash-reports <on\|off\|status> [--json]` | Whether this machine sends crash reports: the **core's** one setting, asked and changed through the core (so the core must be running; otherwise `crash-reports.core-unavailable`). `off` also deletes this connector's pending crash records and its random id (and fails if they cannot be deleted). Prints `on` or `off`; `--json`: `{ok, send}`. See "Crash reports" below. |
 | `pair-device [--json]` | A one-time code from this machine's core (through the connector, started on demand) to pair a device such as the Sidevoice app: the code, its QR, its validity and where it works (`reach`: `direct` or `local-only`). `--json`: `{ok, code, expires_in, reach, payload}`. The MCP tool `voice_pair_device` says the same text. |
 | `--version [--json]` | The release version; with `--json`, also the target and the source commit. |
 
@@ -53,7 +54,7 @@ Every place comes from the environment, so a disposable profile is just a set of
   private again, with one line in the log (`src/private_dir.rs`); it is refused, never repaired, when it belongs to
   someone else, is a link, or any directory above it could have its entries replaced. It holds `connector.lock`,
   `connector.log`, `connector.json`, `agents.json`, `agents.lock`, `node-stopped.json` (a person's stop), the speech
-  outbox, and `core/` (the core's own: `core.json`, which names the core's endpoint);
+  outbox, `connector-crashes/` and `connector-crash-id.json` (crash reports, below), and `core/` (the core's own: `core.json`, which names the core's endpoint);
 - where each program listens is published, not worked out: `D/connector.json` (`{"pid", "endpoint"}`, private,
   written once the connector listens and removed when it exits cleanly; after a crash it stays and `pid` tells it is
   stale) and the core's `D/core/core.json` (`endpoint`). `endpoint` is the record `sidevoice-platform`'s `ipc`
@@ -317,6 +318,44 @@ The successful `uninstall --json` object echoes the same marker. A caller must c
 starting a destructive reset; the post-uninstall echo alone is too late to protect an older installed binary.
 
 With `--json` both print one JSON object and nothing else.
+
+## Crash reports
+
+The connector daemon sends **its own** crash reports to the developers (Sentry), on by default and never asked; nothing
+relays through the core or an app, and the core keeps no copy of a connector record (`src/crash.rs`). A panic of the
+daemon leaves one record in `D/connector-crashes` (private files, at most 20, 1 MiB and 30 days, the same crash one
+record with a count and a first time); the daemon sends each record at its next start, in the background, and deletes it once
+Sentry took it. The report holds a closed list and nothing else: the version, OS and architecture, the panic's location and
+backtrace (addresses, function names, bare file names, and the loaded modules that hold a frame, by bare name, for the
+debug files), the panic message only when it is a literal (else a marker and its length), the last 20 warning and error
+events of the connector's own log with their time as an offset from the crash (no date) and their ids as tokens of that
+record (`d1`, `c1`), and a random per-install id (128 bits, `D/connector-crash-id.json`, replaced after a year, never
+derived from the machine). The count and the first time of a repeated crash stay on the machine. No host name, user, IP, path, environment, log of a dependency or formatted message. Sending
+never delays or breaks the connector: it runs on a thread of its own with timeouts, and a failure is one log line. A build
+with no DSN (every local and pull-request build) records but asks and sends nothing. Only the daemon records: the CLI and
+the MCP server have no file sink.
+
+**The setting has one owner, the core.** "Send crash reports" is one machine setting that the core keeps
+(`D/core/crash-reports.json`; `sidevoice-core crash-reports on|off|status`, and the core's local-only
+`/api/local/crash-reports`, which the desktop app on the same machine sets). The connector keeps no setting of its own and
+no copy: before it sends a record it asks the core over the core's local endpoint (`GET /api/local/crash-reports`, the
+endpoint `core.json` names, once its health identifies the launch), and it asks again before each POST. The answer decides:
+
+- **on**: the records are sent.
+- **off**: the records and the connector's id are deleted, and the daemon makes no more records while it runs. No id is left
+  for a machine that is not on: the core is asked again once the id exists, and a record that an `off` deleted meanwhile is
+  not posted.
+- **no answer** (the core is not running yet, does not answer, or is a release that has no such setting): this is not off.
+  The records stay, nothing is sent, and the next start asks again; the daemon waits for a core that is still starting for
+  up to three minutes.
+
+A setting changed elsewhere while the daemon runs (the app, the core's own command) is asked again every ten minutes and
+whenever the daemon's link to the core is made again, and an `off` is applied at once: the records and the id are deleted.
+The panic hook cannot ask the core, so it records unless this process already learned off; a record made while the setting is
+off, or before it was turned off, is discarded at the next ask. `crash-reports on|off|status` forwards to the same core
+endpoint (`PUT` to change it); `off` also erases what the connector kept and fails (`crash-reports.erase-failed`, exit status
+1) when that cannot be done, as the core's does, the setting being off all the same; `on` and `status` change and erase
+nothing. The connector's id is its own and separate from the core's: each piece on a machine has one.
 
 ## Conversation flow
 

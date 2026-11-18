@@ -24,7 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, Layer};
 
 pub const LOG_MAX: u64 = 5 * 1024 * 1024;
 pub const LOG_KEPT: u32 = 2;
@@ -68,11 +68,29 @@ thread_local! {
 /// From now on this process logs to `file` (and to stderr, on a terminal, unless it runs as a service). `home` is the
 /// one this process resolved: it is shown as `~` in every line.
 pub fn init(file: PathBuf, service: bool, home: &Path) {
+    let homes = spellings(home);
+    if let Some(data) = file.parent() {
+        // From now on a panic of this daemon leaves a crash record (`crate::crash`).
+        let resource = Resource::current();
+        crate::crash::install(
+            data,
+            homes.clone(),
+            resource.os_type,
+            resource.host_arch,
+            redact,
+        );
+    }
     let _ = SINK.set(Sink {
         file,
         service,
-        home: spellings(home),
+        home: homes,
     });
+}
+
+/// Whether this thread is inside the panic hook: what the crash report's warning and error tail must know, since a lock it
+/// would wait for may be held by the thread that panicked.
+fn in_panic_hook() -> bool {
+    IN_PANIC_HOOK.with(Cell::get)
 }
 
 /// Every text spelling of `home` a line may hold, longest first: as is, with forward slashes (Windows), escaped as
@@ -142,14 +160,17 @@ pub fn install(default: &str) {
             .unwrap_or_default(),
     );
     let (filter, invalid) = filter(std::env::var("SIDEVOICE_LOG").ok().as_deref(), default);
+    // The level the person asked for belongs to the log's layer alone: the crash report's tail (`crate::crash`) keeps the last
+    // warnings and errors of our own targets whatever that level is.
     let layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .with_target(true)
         .log_internal_errors(false)
-        .with_writer(LogWriter);
+        .with_writer(LogWriter)
+        .with_filter(filter);
     if tracing_subscriber::registry()
-        .with(filter)
         .with(layer)
+        .with(crate::crash::tail_layer(in_panic_hook))
         .try_init()
         .is_err()
     {
@@ -215,6 +236,14 @@ fn record_panic(
         exception.type = "panic",
         exception.stacktrace = ?backtrace,
         "the backtrace of the panic recorded just before"
+    );
+    // Last, so the events above are in the log before the record is made (the record's own tail leaves the panic out: the record
+    // says what the panic was). It is sent at the next start (`crate::crash`).
+    crate::crash::capture(
+        payload.downcast_ref::<&'static str>().copied(),
+        len.unwrap_or_default(),
+        file.unwrap_or_default(),
+        line.unwrap_or_default(),
     );
 }
 

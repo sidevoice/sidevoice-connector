@@ -7,3 +7,8 @@ xtask = "run --quiet --locked --package xtask --bin xtask --"
 # (`cargo xtask verify` fails a release whose binary imports vcruntime*.dll, xtask/src/verify.rs).
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# Every Linux binary has a build id: a crash report's modules are matched to the release's debug files by it
+# (connector/src/crash/trace.rs, the module's debug id). The linker `cargo zigbuild` drives adds none by itself.
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "link-arg=-Wl,--build-id=sha1"]

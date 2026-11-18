@@ -48,6 +48,10 @@ pub enum ConnectorError {
     WebSocket,
     #[error("a JSON document was invalid")]
     Json,
+    #[error("the crash report setting or records cannot be read or changed")]
+    CrashReportsUnavailable,
+    #[error("a crash report could not be sent")]
+    CrashReportFailed,
 }
 
 impl ConnectorError {
@@ -74,6 +78,8 @@ impl ConnectorError {
         Self::Timeout,
         Self::WebSocket,
         Self::Json,
+        Self::CrashReportsUnavailable,
+        Self::CrashReportFailed,
     ];
 
     /// The stable code: the value of `error.type`.
@@ -99,6 +105,8 @@ impl ConnectorError {
             Self::Timeout => "connector.timeout",
             Self::WebSocket => "connector.websocket",
             Self::Json => "connector.json",
+            Self::CrashReportsUnavailable => "connector.crash-reports-unavailable",
+            Self::CrashReportFailed => "connector.crash-report-failed",
         }
     }
 

@@ -173,6 +173,8 @@ const KEPT: &[&str] = &[
 const OWNED: &[&str] = &[
     "agents.json",
     "agents.lock",
+    "connector-crash-id.json",
+    "connector-crashes",
     "connector.json",
     "connector.lock",
     "connector.log",
@@ -2111,6 +2113,11 @@ pub(crate) mod tests {
 
         // Uninstall removes releases and owned data, preserving the stop.
         Files::write_json(&layout.data.join("outbox.json"), &json!([])).unwrap();
+        // What the crash reports keep in `D` (a pending record and the connector's own id) is the connector's too.
+        let crashes = layout.data.join("connector-crashes");
+        fs::create_dir_all(&crashes).unwrap();
+        fs::write(crashes.join("crash-x.json"), "{}").unwrap();
+        fs::write(layout.data.join("connector-crash-id.json"), "{}").unwrap();
         crate::lock::try_lock(&layout.data.join("agents.lock"), "test").unwrap();
         // The shared models are another program's: if they are in `D` (un-overridden), they and what is in them survive.
         let models = layout.data.join(data_dir::MODELS).join("other-program");

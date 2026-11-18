@@ -1,8 +1,8 @@
 #![allow(clippy::disallowed_macros)] // the command line's output for people is not logging
 use sidevoice_connector::platform::service::{Service, Services};
 use sidevoice_connector::{
-    adapters, agents, core_package, daemon, identity, install, logfile, mcp, messages, pairing,
-    profile, service,
+    adapters, agents, core_package, crash, daemon, identity, install, logfile, mcp, messages,
+    pairing, profile, service,
 };
 
 use anyhow::Result;
@@ -63,6 +63,12 @@ enum Action {
         #[command(subcommand)]
         command: ServiceAction,
     },
+    /// Whether this machine sends crash reports: the core's one setting, asked and changed through the core (so it needs the
+    /// core running). Off also deletes this connector's pending reports and its random id.
+    CrashReports {
+        #[arg(value_enum)]
+        setting: Switch,
+    },
     /// Show a one-time code (and its QR) to pair a device, such as the Sidevoice app, with this machine.
     PairDevice,
     /// The installer's step for the core: stage the core this package carries into RELEASE/core.
@@ -101,12 +107,13 @@ enum ServiceAction {
     /// Whether Sidevoice starts at the next login; changing it neither starts nor stops it now.
     Login {
         #[arg(value_enum)]
-        setting: LoginSetting,
+        setting: Switch,
     },
 }
 
+/// `on`, `off` or `status`: a setting that is one of two states and can be asked.
 #[derive(Clone, Copy, clap::ValueEnum)]
-enum LoginSetting {
+enum Switch {
     On,
     Off,
     Status,
@@ -200,9 +207,9 @@ async fn run(action: Action, json: bool) -> Result<ExitCode> {
             ServiceAction::Status => service::Action::Status,
             ServiceAction::Uninstall => service::Action::Uninstall,
             ServiceAction::Login { setting } => service::Action::Login(match setting {
-                LoginSetting::On => Some(true),
-                LoginSetting::Off => Some(false),
-                LoginSetting::Status => None,
+                Switch::On => Some(true),
+                Switch::Off => Some(false),
+                Switch::Status => None,
             }),
         };
         let homes = adapters::Registry::homes();
@@ -299,6 +306,23 @@ async fn run(action: Action, json: bool) -> Result<ExitCode> {
                 .map(|()| ExitCode::SUCCESS)
         }
         Action::Agents { action } => agents_command(profile, action, json).await,
+        Action::CrashReports { setting } => {
+            let send = crash::forward(
+                &profile,
+                match setting {
+                    Switch::On => Some(true),
+                    Switch::Off => Some(false),
+                    Switch::Status => None,
+                },
+            )
+            .await?;
+            if json {
+                println!("{}", json!({"ok":true,"send":send}));
+            } else {
+                println!("{}", if send { "on" } else { "off" });
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Action::PairDevice => {
             let answer = pairing::device_code(&profile).await?;
             if json {
