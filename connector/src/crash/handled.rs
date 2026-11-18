@@ -17,24 +17,26 @@
 //!   list lives in memory and in `connector-handled-errors.json` (private, in the connector's data directory, read at start and
 //!   written after a send); a different day, a clock that went back or a file that says another day all mean a new day. At most
 //!   [`MAX_TYPES`] types a day, so neither a storm of codes nor a bad file can make the list or the day's sends unbounded.
-//! - **Under the switch, which the core owns.** The connector has no setting: the layer queues only while the core's last
-//!   answer, which the daemon already keeps (`CrashStore::is_on`), was "on". An answer never learned (the core is not running
-//!   yet, has no such setting) and "off" queue nothing. The sender checks that again, asks the core itself before each send, and
-//!   asks once more after the id and the day's list exist, as the crash reports do for the id: "off" erases the list with the
-//!   id and the records, and what the sender remembered. A core that cannot be asked sends nothing.
+//! - **Under the switch, which the core owns.** The connector has no setting: the layer stops queueing only when the core's
+//!   last answer, which the daemon already keeps (`CrashStore::is_off`), is "off". While the answer is unknown (the core is
+//!   not reachable yet, or restarting) events are queued, in the bounded queue below, with the time they happened. The sender
+//!   asks the core itself right before each send, and asks once more after the id and the day's list exist, as the crash
+//!   reports do for the id: "on" sends, "off" discards the queue and erases the list with the id and the records, and what the
+//!   sender remembered; an ask that is not answered sends nothing and keeps the event waiting, to ask again after [`RETRY`].
 //! - **Never breaks the connector.** The layer does no network, no file and no waiting: it checks, reads one atomic and
-//!   `try_send`s into a queue of [`QUEUE`] (a full queue drops the event). The POST is on a thread of its own, one at a time,
+//!   `try_send`s into a queue of [`QUEUE`] (a full queue drops the event, as does a full wait for the core). The POST is on a thread of its own, one at a time,
 //!   [`POST_BUDGET`] each, `catch_unwind` around each event, and after a failed send, or a core that did not answer, it waits
 //!   [`QUIET`] before trying again (an error that comes with the network down comes in storms). That thread never feeds itself:
 //!   what it logs is `warn`, and the layer ignores events of a sending thread.
 
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::io;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -68,6 +70,9 @@ const QUEUE: usize = 16;
 /// How many error types one day's list holds.
 pub(super) const MAX_TYPES: usize = 64;
 /// How long the sender leaves the network and the core alone after a failed send or an unanswered ask.
+/// How long the core is left alone after an ask it did not answer, the events waiting meanwhile.
+const RETRY: Duration = Duration::from_secs(30);
+/// How long the network is left alone after a failed send.
 const QUIET: Duration = Duration::from_secs(10 * 60);
 /// The day's list, a private file of the connector's data directory.
 const CAP: &str = "connector-handled-errors.json";
@@ -81,6 +86,8 @@ pub(super) struct Handled {
     pub kind: &'static str,
     pub file: String,
     pub line: u32,
+    /// When it happened: what is sent is this, not the time of the send.
+    pub time: SystemTime,
 }
 
 /// The events without a usable `error.type` seen by this process.
@@ -102,8 +109,8 @@ pub(super) fn known(text: &str) -> Option<&'static str> {
 }
 
 /// The layer of the process: `None` (nothing is ever queued) when the build has no DSN, silently, as for the crash reports.
-/// It is made before the daemon knows its data directory, so it asks the process's crash context at each event: no context
-/// (the CLI, the MCP server) or a core that has not said "on" queues nothing.
+/// It is made before the daemon knows its data directory, so it asks the process's crash context at each event: only a core
+/// known to be off queues nothing. Without a context (the CLI, the MCP server) the queue is never drained.
 pub fn layer<S>(in_hook: fn() -> bool) -> Option<impl Layer<S>>
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
@@ -112,17 +119,17 @@ where
     let (queue, waiting) = sync_channel(QUEUE);
     *PENDING.lock().unwrap_or_else(PoisonError::into_inner) = Some(waiting);
     Some(queueing(
-        || CONTEXT.get().is_some_and(|context| context.store.is_on()),
+        || CONTEXT.get().is_some_and(|context| context.store.is_off()),
         queue,
         &UNTYPED,
         in_hook,
     ))
 }
 
-/// The layer, with its filter: events at `error` of our targets, the panic hook's own never. `on` says whether the core's last
-/// answer was "on".
+/// The layer, with its filter: events at `error` of our targets, the panic hook's own never. `off` says whether the core's last
+/// answer was "off".
 pub(super) fn queueing<S>(
-    on: impl Fn() -> bool + Send + Sync + 'static,
+    off: impl Fn() -> bool + Send + Sync + 'static,
     queue: SyncSender<Handled>,
     untyped: &'static AtomicU64,
     in_hook: fn() -> bool,
@@ -131,7 +138,7 @@ where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
     Queueing {
-        on,
+        off,
         queue,
         untyped,
         in_hook,
@@ -173,7 +180,7 @@ impl Visit for ErrorType {
 }
 
 struct Queueing<G> {
-    on: G,
+    off: G,
     queue: SyncSender<Handled>,
     untyped: &'static AtomicU64,
     /// Whether this thread is inside the panic hook: nothing is done there.
@@ -192,8 +199,8 @@ impl<S: Subscriber, G: Fn() -> bool + 'static> Layer<S> for Queueing<G> {
             self.untyped.fetch_add(1, Ordering::Relaxed);
             return;
         };
-        // The core has not said "on" (never answered, or off): nothing is queued.
-        if !(self.on)() {
+        // Known off: nothing is queued. Not known yet: queued, and the sender asks.
+        if (self.off)() {
             return;
         }
         let meta = event.metadata();
@@ -202,6 +209,7 @@ impl<S: Subscriber, G: Fn() -> bool + 'static> Layer<S> for Queueing<G> {
             kind,
             file: relative_path(meta.file().unwrap_or("")),
             line: meta.line().unwrap_or(0),
+            time: SystemTime::now(),
         });
     }
 }
@@ -220,7 +228,8 @@ pub(super) fn event(context: &Context, error: &Handled, machine_id: &str) -> Eve
         platform: Cow::Borrowed("native"),
         // Never the host name: said, not assumed (no client exists to fill it in).
         server_name: None,
-        timestamp: SystemTime::now(),
+        // The time it happened, not the time of the send.
+        timestamp: error.time,
         release: Some(release(crate::identity::VERSION)),
         tags: tags([
             ("service.name", SERVICE),
@@ -336,9 +345,9 @@ pub(super) fn remove_cap(data: &Path) -> io::Result<()> {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Outcome {
     Sent,
-    /// The core's last answer is "off" (or the ask just now said so), or it has not said "on" yet.
+    /// The core's last answer is "off", or the ask just now said so.
     Off,
-    /// The core could not be asked just now.
+    /// The core could not be asked just now: the event waits.
     Unknown,
     /// Its type was already sent today, or the day's list is full.
     Capped,
@@ -355,6 +364,9 @@ pub(super) struct Worker<'a> {
     dsn: Dsn,
     cap: Cap,
     quiet_until: Option<Instant>,
+    /// Until when the core is not asked again, after an ask it did not answer.
+    unknown_until: Option<Instant>,
+    retry: Duration,
 }
 
 impl<'a> Worker<'a> {
@@ -365,6 +377,8 @@ impl<'a> Worker<'a> {
             dsn,
             cap: Cap::load(&context.data, Utc::now().date_naive(), MAX_TYPES),
             quiet_until: None,
+            unknown_until: None,
+            retry: RETRY,
         }
     }
 
@@ -375,39 +389,49 @@ impl<'a> Worker<'a> {
         self
     }
 
+    /// The same, waiting `retry` before the core is asked again.
+    #[cfg(test)]
+    pub(super) fn retrying(mut self, retry: Duration) -> Self {
+        self.retry = retry;
+        self
+    }
+
     /// Sends `error` unless the core's answer is not "on", its type is capped on `today` or the network failed a moment ago.
     /// The type is counted as sent only once Sentry took the event, so an error that came with the network down is reported
     /// when it comes again.
-    pub(super) fn handle(&mut self, error: Handled, today: NaiveDate, ask: Ask<'_>) -> Outcome {
+    pub(super) fn handle(&mut self, error: &Handled, today: NaiveDate, ask: Ask<'_>) -> Outcome {
         let context = self.context;
         if self.quiet_until.is_some_and(|until| Instant::now() < until) {
             return Outcome::Quiet;
         }
-        // What this process learned from the core: off means what this one remembers goes with what the machine kept; not
-        // knowing is not on.
+        // What this process learned from the core: off means what this one remembers goes with what the machine kept. Not
+        // knowing is asked below.
         if context.store.is_off() {
             self.cap = Cap::empty(self.cap.max);
-            return Outcome::Off;
-        }
-        if !context.store.is_on() {
             return Outcome::Off;
         }
         if !self.cap.permits(error.kind, today) {
             return Outcome::Capped;
         }
+        if self
+            .unknown_until
+            .is_some_and(|until| Instant::now() < until)
+        {
+            return Outcome::Unknown;
+        }
         match ask() {
-            Some(true) => {}
+            Some(true) => self.unknown_until = None,
             Some(false) => {
                 discard(context);
                 self.cap = Cap::empty(self.cap.max);
                 return Outcome::Off;
             }
-            // Cannot be learned: never sent blind, and the core is left alone for a while.
+            // Cannot be learned: never sent blind, the event waits and the core is left alone for a while.
             None => {
-                self.quiet_until = Some(Instant::now() + QUIET);
+                self.unknown_until = Some(Instant::now() + self.retry);
                 warn!(
                     error.type = ConnectorError::CrashReportsUnavailable.code(),
-                    "the core did not say whether crash reports may be sent, so a handled error was not reported; none is tried again for a while"
+                    "the core did not say whether crash reports may be sent, so handled errors wait; it is asked again in a while"
                 );
                 return Outcome::Unknown;
             }
@@ -423,7 +447,7 @@ impl<'a> Worker<'a> {
                 return Outcome::Unsent;
             }
         };
-        if !deliver(&self.agent, &self.dsn, event(context, &error, &id)) {
+        if !deliver(&self.agent, &self.dsn, event(context, error, &id)) {
             self.quiet_until = Some(Instant::now() + QUIET);
             warn!(
                 error.type = ConnectorError::CrashReportFailed.code(),
@@ -485,14 +509,52 @@ pub(super) fn send_from_now_on(context: &'static Context, profile: Profile) {
 
 /// The sender's loop: it ends only if the layer's queue is gone, and an event that makes it panic costs that event.
 pub(super) fn serve(context: &Context, dsn: Dsn, waiting: &Receiver<Handled>, ask: Ask<'_>) {
-    let mut worker = Worker::new(context, dsn);
-    while let Ok(error) = waiting.recv() {
-        let today = Utc::now().date_naive();
-        if catch_unwind(AssertUnwindSafe(|| worker.handle(error, today, ask))).is_err() {
-            warn!(
-                error.type = ConnectorError::CrashReportFailed.code(),
-                "the reporter of handled errors failed and was contained; the connector goes on"
-            );
+    run(Worker::new(context, dsn), waiting, ask);
+}
+
+/// `serve` with a given worker. Events whose core could not be asked wait here, in order and at most [`QUEUE`] of them (the
+/// queue behind them holds as many again), and are tried again after the worker's retry, or sooner as the next event comes
+/// (the worker does not ask the core before its time). "Off" discards them and what is queued.
+pub(super) fn run(mut worker: Worker<'_>, waiting: &Receiver<Handled>, ask: Ask<'_>) {
+    let mut held: VecDeque<Handled> = VecDeque::new();
+    let mut closed = false;
+    loop {
+        let next = if held.is_empty() {
+            waiting.recv().map_err(|_| RecvTimeoutError::Disconnected)
+        } else {
+            waiting.recv_timeout(worker.retry)
+        };
+        match next {
+            Ok(error) if held.len() < QUEUE => held.push_back(error),
+            Ok(_) | Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                if held.is_empty() {
+                    return;
+                }
+                // One last try for what waits.
+                closed = true;
+            }
+        }
+        while let Some(error) = held.pop_front() {
+            let today = Utc::now().date_naive();
+            match catch_unwind(AssertUnwindSafe(|| worker.handle(&error, today, ask))) {
+                Ok(Outcome::Unknown) => {
+                    held.push_front(error);
+                    break;
+                }
+                Ok(Outcome::Off) => {
+                    held.clear();
+                    while waiting.try_recv().is_ok() {}
+                }
+                Ok(_) => {}
+                Err(_) => warn!(
+                    error.type = ConnectorError::CrashReportFailed.code(),
+                    "the reporter of handled errors failed and was contained; the connector goes on"
+                ),
+            }
+        }
+        if closed {
+            return;
         }
     }
 }

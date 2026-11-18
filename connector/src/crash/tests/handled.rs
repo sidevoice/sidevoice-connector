@@ -1,9 +1,10 @@
-//! Handled errors: what is read from an event, what is sent, how often, and never while the core has not said "on".
+//! Handled errors: what is read from an event, what is sent, how often, and never once the core says "off".
 
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use chrono::{Days, NaiveDate};
 use tracing::{event, Level};
@@ -11,7 +12,7 @@ use tracing_subscriber::layer::SubscriberExt;
 
 use super::*;
 use crate::crash::handled::{
-    event as handled_event, known, queueing, serve, Handled, Outcome, Worker, MAX_TYPES,
+    event as handled_event, known, queueing, run, serve, Handled, Outcome, Worker, MAX_TYPES,
 };
 use crate::crash::record::relative_path;
 use crate::crash::HANDLED_TAGS;
@@ -29,15 +30,15 @@ const B: &str = "connector.timeout";
 const C: &str = "connector.json";
 const D: &str = "connector.websocket";
 
-/// What a subscriber with only the handled-errors layer queues while `emit` logs, with the core's answer as `on` says, and how
+/// What a subscriber with only the handled-errors layer queues while `emit` logs, with the core known to be off as `off` says, and how
 /// many events had no code of the connector's own.
-fn queued(on: bool, capacity: usize, emit: impl FnOnce()) -> (Vec<Handled>, u64) {
+fn queued(off: bool, capacity: usize, emit: impl FnOnce()) -> (Vec<Handled>, u64) {
     static COUNTED: AtomicU64 = AtomicU64::new(0);
     // Each test takes the difference, so another test's events do not count.
     let before = COUNTED.load(Ordering::Relaxed);
     let (queue, waiting): (_, Receiver<Handled>) = sync_channel(capacity);
     let subscriber =
-        tracing_subscriber::registry().with(queueing(move || on, queue, &COUNTED, || false));
+        tracing_subscriber::registry().with(queueing(move || off, queue, &COUNTED, || false));
     tracing::subscriber::with_default(subscriber, emit);
     (
         waiting.try_iter().collect(),
@@ -54,6 +55,7 @@ fn error_of(kind: &'static str) -> Handled {
         kind,
         file: "connector/src/daemon.rs".to_owned(),
         line: 7,
+        time: SystemTime::now(),
     }
 }
 
@@ -74,7 +76,7 @@ fn yes() -> Option<bool> {
 
 /// `handle` with a core that always says on.
 fn send(worker: &mut Worker<'_>, kind: &'static str, day: NaiveDate) -> Outcome {
-    worker.handle(error_of(kind), day, &yes)
+    worker.handle(&error_of(kind), day, &yes)
 }
 
 fn saved(f: &Fixture) -> Value {
@@ -110,7 +112,7 @@ fn the_connectors_codes_are_what_an_error_type_must_be() {
 
 #[test]
 fn only_error_events_of_our_own_targets_are_taken_and_never_the_panic_hooks() {
-    let (events, untyped) = queued(true, 16, || {
+    let (events, untyped) = queued(false, 16, || {
         event!(target: "sidevoice_connector::daemon", Level::ERROR, error.type = A, "ours");
         event!(target: "sidevoice_connector", Level::ERROR, error.type = B, "the crate itself");
         event!(target: "sidevoice_platform::fs", Level::ERROR, error.type = C, "ours too");
@@ -137,8 +139,9 @@ fn only_error_events_of_our_own_targets_are_taken_and_never_the_panic_hooks() {
 
 #[test]
 fn an_event_is_read_for_its_code_and_its_place_and_for_nothing_else() {
+    let started = SystemTime::now();
     let line = line!() + 2;
-    let (events, _) = queued(true, 16, || {
+    let (events, _) = queued(false, 16, || {
         event!(
             target: "sidevoice_connector::daemon",
             Level::ERROR,
@@ -153,20 +156,17 @@ fn an_event_is_read_for_its_code_and_its_place_and_for_nothing_else() {
             "the port canary words 7f3a was taken by canary-secret-7f3a"
         );
     });
-    assert_eq!(
-        events,
-        [Handled {
-            kind: A,
-            // The callsite's, not what a field claims.
-            file: "connector/src/crash/tests/handled.rs".to_owned(),
-            line,
-        }]
-    );
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, A);
+    // The callsite's, not what a field claims.
+    assert_eq!(events[0].file, "connector/src/crash/tests/handled.rs");
+    assert_eq!(events[0].line, line);
+    assert!(events[0].time >= started && events[0].time <= SystemTime::now());
 }
 
 #[test]
 fn an_error_type_that_is_not_one_of_the_connectors_codes_is_counted_and_never_taken() {
-    let (events, untyped) = queued(true, 16, || {
+    let (events, untyped) = queued(false, 16, || {
         event!(target: "sidevoice_connector::x", Level::ERROR, "no field at all");
         event!(target: "sidevoice_connector::x", Level::ERROR, reason = A, "another field");
         // The code only counts when it is a string.
@@ -195,7 +195,7 @@ fn an_error_type_that_is_not_one_of_the_connectors_codes_is_counted_and_never_ta
 #[test]
 fn every_code_of_the_connector_is_one_that_leaves_and_leaves_as_its_own_text() {
     let all: Vec<&'static str> = codes().collect();
-    let (events, untyped) = queued(true, 64, || {
+    let (events, untyped) = queued(false, 64, || {
         for code in &all {
             event!(target: "sidevoice_connector::x", Level::ERROR, error.type = *code, "a failure");
         }
@@ -237,14 +237,15 @@ fn the_place_is_a_short_relative_path_or_unknown() {
 // The layer: the core's answer, the hook and the queue.
 
 #[test]
-fn nothing_is_queued_until_the_core_has_said_on() {
+fn nothing_is_queued_only_once_the_core_is_known_to_be_off() {
     let emit = || event!(target: "sidevoice_connector::x", Level::ERROR, error.type = A, "failed");
-    assert_eq!(queued(true, 16, emit).0.len(), 1, "the core said on");
-    assert!(
-        queued(false, 16, emit).0.is_empty(),
-        "never answered, or off"
+    assert_eq!(
+        queued(false, 16, emit).0.len(),
+        1,
+        "not off: unknown, or on"
     );
-    // What the daemon keeps of the core's answers, which the layer reads in the process: not knowing is not on.
+    assert!(queued(true, 16, emit).0.is_empty(), "known off");
+    // What the daemon keeps of the core's answers, which the layer reads in the process: not knowing is neither.
     let f = fixture();
     assert!(!f.store.is_on() && !f.store.is_off(), "nothing learned yet");
     f.store.learned(true);
@@ -268,34 +269,34 @@ fn the_gate_follows_the_cached_answer_as_it_changes() {
         || false,
     ));
     tracing::subscriber::with_default(subscriber, || {
-        event!(target: "sidevoice_connector::x", Level::ERROR, error.type = A, "before");
+        event!(target: "sidevoice_connector::x", Level::ERROR, error.type = A, "unknown");
         answer.store(true, Ordering::SeqCst);
-        event!(target: "sidevoice_connector::x", Level::ERROR, error.type = B, "while on");
+        event!(target: "sidevoice_connector::x", Level::ERROR, error.type = B, "while off");
         answer.store(false, Ordering::SeqCst);
-        event!(target: "sidevoice_connector::x", Level::ERROR, error.type = C, "after");
+        event!(target: "sidevoice_connector::x", Level::ERROR, error.type = C, "on again");
     });
     let seen: Vec<&str> = waiting.try_iter().map(|event| event.kind).collect();
-    assert_eq!(seen, [B]);
+    assert_eq!(seen, [A, C], "queued while not off, not while off");
 }
 
 #[test]
 fn a_sending_thread_and_the_panic_hook_never_feed_the_queue() {
     let emit = || event!(target: "sidevoice_connector::x", Level::ERROR, error.type = A, "failed");
     SENDING.set(true);
-    let from_a_sender = queued(true, 16, emit).0;
+    let from_a_sender = queued(false, 16, emit).0;
     SENDING.set(false);
     assert!(from_a_sender.is_empty());
     static COUNTED: AtomicU64 = AtomicU64::new(0);
     let (queue, waiting) = sync_channel(16);
     let subscriber =
-        tracing_subscriber::registry().with(queueing(|| true, queue, &COUNTED, || true));
+        tracing_subscriber::registry().with(queueing(|| false, queue, &COUNTED, || true));
     tracing::subscriber::with_default(subscriber, emit);
     assert!(waiting.try_iter().next().is_none(), "inside the hook");
 }
 
 #[test]
 fn a_full_queue_drops_the_event_and_the_logging_thread_never_waits() {
-    let (events, _) = queued(true, 2, || {
+    let (events, _) = queued(false, 2, || {
         for n in 0..50 {
             event!(target: "sidevoice_connector::x", Level::ERROR, error.type = A, n, "failed");
         }
@@ -308,7 +309,7 @@ fn a_full_queue_drops_the_event_and_the_logging_thread_never_waits() {
 #[test]
 fn the_event_carries_the_closed_field_list_and_no_text_of_the_event() {
     let f = fixture();
-    let (events, _) = queued(true, 16, || {
+    let (events, _) = queued(false, 16, || {
         event!(
             target: "sidevoice_connector::daemon",
             Level::ERROR,
@@ -536,7 +537,7 @@ fn the_days_list_and_so_the_days_sends_are_bounded() {
 // Under the core's answer.
 
 #[test]
-fn nothing_is_sent_or_made_while_the_core_has_not_said_on() {
+fn nothing_is_sent_or_made_once_the_core_is_known_to_be_off() {
     let f = fixture();
     let server = Sentry::start(200);
     let context = context(&f);
@@ -547,14 +548,22 @@ fn nothing_is_sent_or_made_while_the_core_has_not_said_on() {
         asked.set(asked.get() + 1);
         Some(true)
     };
-    // The core never answered (the daemon has learned nothing): even a core that would say on is not asked.
-    assert_eq!(worker.handle(error_of(A), day, &ask), Outcome::Off);
-    assert_eq!(asked.get(), 0);
-    // Learned off: the same.
     context.store.learned(false);
-    assert_eq!(worker.handle(error_of(A), day, &ask), Outcome::Off);
+    assert_eq!(worker.handle(&error_of(A), day, &ask), Outcome::Off);
+    assert_eq!(asked.get(), 0, "known off: the core is not even asked");
     assert!(server.requests().is_empty());
     assert!(names(&f.data).is_empty(), "no id and no list were made");
+}
+
+#[test]
+fn an_unknown_answer_is_asked_and_a_core_that_says_on_gets_the_event_sent() {
+    let f = fixture();
+    let server = Sentry::start(200);
+    let context = context(&f);
+    assert!(!context.store.is_on() && !context.store.is_off());
+    let mut worker = Worker::new(&context, server.dsn());
+    assert_eq!(send(&mut worker, A, today()), Outcome::Sent);
+    assert_eq!(server.requests().len(), 1);
 }
 
 #[test]
@@ -570,7 +579,7 @@ fn a_core_that_says_off_when_asked_erases_the_list_the_id_and_the_records_and_no
     assert!(f.data.join("connector-crash-id.json").exists());
 
     assert_eq!(
-        worker.handle(error_of(B), day, &|| Some(false)),
+        worker.handle(&error_of(B), day, &|| Some(false)),
         Outcome::Off
     );
     assert!(names(&f.data).is_empty(), "{:?}", names(&f.data));
@@ -584,7 +593,7 @@ fn a_core_that_says_off_when_asked_erases_the_list_the_id_and_the_records_and_no
 }
 
 #[test]
-fn a_core_that_cannot_be_asked_is_not_on_and_the_core_is_left_alone_for_a_while() {
+fn a_core_that_cannot_be_asked_sends_nothing_and_is_left_alone_until_the_retry() {
     let f = fixture();
     let server = Sentry::start(200);
     let context = on(&f);
@@ -595,16 +604,110 @@ fn a_core_that_cannot_be_asked_is_not_on_and_the_core_is_left_alone_for_a_while(
         asked.set(asked.get() + 1);
         None
     };
-    assert_eq!(worker.handle(error_of(A), day, &silent), Outcome::Unknown);
-    assert_eq!(worker.handle(error_of(B), day, &silent), Outcome::Quiet);
-    assert_eq!(worker.handle(error_of(C), day, &yes), Outcome::Quiet);
-    assert_eq!(asked.get(), 1, "one try, then quiet");
+    assert_eq!(worker.handle(&error_of(A), day, &silent), Outcome::Unknown);
+    assert_eq!(worker.handle(&error_of(B), day, &silent), Outcome::Unknown);
+    assert_eq!(worker.handle(&error_of(C), day, &yes), Outcome::Unknown);
+    assert_eq!(asked.get(), 1, "one try, then left alone");
     assert!(server.requests().is_empty(), "never sent blind");
     assert!(names(&f.data).is_empty(), "no id and no list were made");
     assert!(
         !context.store.is_off(),
         "an answer that did not come is not off"
     );
+}
+
+/// A queue of `errors`, closed, for the sender.
+fn queue_of(errors: Vec<Handled>) -> Receiver<Handled> {
+    let (queue, waiting) = sync_channel(errors.len().max(1));
+    for error in errors {
+        queue.send(error).unwrap();
+    }
+    waiting
+}
+
+#[test]
+fn errors_met_while_the_core_is_unknown_wait_and_leave_when_it_says_on_with_their_own_time() {
+    let f = fixture();
+    let server = Sentry::start(200);
+    let context = context(&f);
+    let past = SystemTime::now() - Duration::from_secs(3600);
+    let error = Handled {
+        time: past,
+        ..error_of(A)
+    };
+    // The event as it will be sent carries the time it happened, not the time of the send.
+    assert_eq!(handled_event(&context, &error, MACHINE).timestamp, past);
+    let asked = Cell::new(0);
+    // Not answered twice, then on.
+    let ask = || {
+        asked.set(asked.get() + 1);
+        (asked.get() > 2).then_some(true)
+    };
+    let waiting = queue_of(vec![error, error_of(B)]);
+    let worker = Worker::new(&context, server.dsn()).retrying(Duration::ZERO);
+    run(worker, &waiting, &ask);
+    assert_eq!(
+        server.requests().len(),
+        2,
+        "both left once the core said on"
+    );
+    assert!(asked.get() >= 3);
+    let body = String::from_utf8_lossy(&server.requests()[0].1).into_owned();
+    // The time it happened (an hour ago), as the Sentry timestamp, not the time of the send.
+    let secs = past
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(
+        body.contains(&format!("\"timestamp\":{secs}.")),
+        "{secs} not in {body}"
+    );
+    assert_eq!(saved(&f)["sent"], json!([A, B]));
+}
+
+#[test]
+fn errors_waiting_for_a_core_that_then_says_off_are_discarded_with_the_queue_and_the_list() {
+    let f = fixture();
+    let server = Sentry::start(200);
+    let context = context(&f);
+    // A first send makes the list; then the core is unknown, then off.
+    f.store.record(record(1)).unwrap();
+    let mut worker = Worker::new(&context, server.dsn()).retrying(Duration::ZERO);
+    assert_eq!(send(&mut worker, A, today()), Outcome::Sent);
+    let answers = RefCell::new(vec![None, Some(false)].into_iter());
+    let ask = || answers.borrow_mut().next().unwrap_or(Some(false));
+    let waiting = queue_of(vec![error_of(B), error_of(C), error_of(D)]);
+    run(worker, &waiting, &ask);
+    assert_eq!(server.requests().len(), 1, "nothing left after the off");
+    assert!(waiting.try_recv().is_err(), "the queue was cleared");
+    assert!(names(&f.data).is_empty(), "{:?}", names(&f.data));
+}
+
+#[test]
+fn the_wait_for_the_core_is_bounded_and_drops_what_does_not_fit() {
+    let f = fixture();
+    let server = Sentry::start(200);
+    let context = context(&f);
+    let kinds: Vec<&'static str> = codes().collect();
+    assert!(
+        kinds.len() > 16,
+        "the test needs more codes than the wait holds"
+    );
+    // The core does not answer until the queue ended: the wait holds 16 of them and drops the rest.
+    let asked = Cell::new(0);
+    let total = kinds.len();
+    let ask = || {
+        asked.set(asked.get() + 1);
+        (asked.get() > total).then_some(true)
+    };
+    let (queue, waiting) = sync_channel(total);
+    for kind in &kinds {
+        queue.send(error_of(kind)).unwrap();
+    }
+    drop(queue);
+    let worker = Worker::new(&context, server.dsn()).retrying(Duration::ZERO);
+    run(worker, &waiting, &ask);
+    assert_eq!(server.requests().len(), 16);
 }
 
 #[test]
@@ -616,7 +719,7 @@ fn an_off_that_comes_after_the_send_leaves_neither_the_id_nor_the_list_behind() 
     let answers = RefCell::new(vec![Some(true), Some(false)]);
     let ask = || answers.borrow_mut().remove(0);
     let mut worker = Worker::new(&context, server.dsn());
-    assert_eq!(worker.handle(error_of(A), today(), &ask), Outcome::Sent);
+    assert_eq!(worker.handle(&error_of(A), today(), &ask), Outcome::Sent);
     assert!(names(&f.data).is_empty(), "{:?}", names(&f.data));
     assert!(context.store.is_off());
     assert_eq!(server.requests().len(), 1);
@@ -627,7 +730,7 @@ fn an_off_that_comes_after_the_send_leaves_neither_the_id_nor_the_list_behind() 
     let answers = RefCell::new(vec![Some(true), None]);
     let ask = || answers.borrow_mut().remove(0);
     let mut worker = Worker::new(&context, server.dsn());
-    assert_eq!(worker.handle(error_of(A), today(), &ask), Outcome::Sent);
+    assert_eq!(worker.handle(&error_of(A), today(), &ask), Outcome::Sent);
     assert_eq!(
         names(&f.data),
         ["connector-crash-id.json", "connector-handled-errors.json"]
@@ -686,7 +789,7 @@ fn what_reaches_the_server_is_the_closed_event_under_the_install_id() {
     let f = fixture();
     let server = Sentry::start(200);
     let context = on(&f);
-    let (events, _) = queued(true, 16, || {
+    let (events, _) = queued(false, 16, || {
         event!(
             target: "sidevoice_connector::daemon",
             Level::ERROR,
@@ -698,7 +801,7 @@ fn what_reaches_the_server_is_the_closed_event_under_the_install_id() {
         );
     });
     let mut worker = Worker::new(&context, server.dsn());
-    let sent = worker.handle(events.into_iter().next().unwrap(), today(), &yes);
+    let sent = worker.handle(&events[0], today(), &yes);
     assert_eq!(sent, Outcome::Sent);
     let requests = server.requests();
     assert_eq!(requests.len(), 1);
