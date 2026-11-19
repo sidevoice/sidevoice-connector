@@ -177,7 +177,9 @@ pub fn envelope(event: &Value) -> Result<String> {
         tag_value(session_id),
         tag_value(message_id)
     );
-    if channel != "room-control" {
+    // Only a message with person input has a style: a note has none, and a missing
+    // core field would falsely read as the default.
+    if channel == "voice" {
         tag.push_str(" style=");
         tag.push_str(speaking_style(event));
     }
@@ -326,7 +328,7 @@ mod tests {
             "message_id":"note:9","text":""});
         assert_eq!(
             envelope(&frame).unwrap(),
-            "[sidevoice channel=note session_id=s revision=4 epoch=2 message_id=note:9 style=normal]\n\nSee the Sidevoice instructions."
+            "[sidevoice channel=note session_id=s revision=4 epoch=2 message_id=note:9]\n\nSee the Sidevoice instructions."
         );
     }
 
@@ -370,10 +372,12 @@ mod tests {
         for value in [json!("hands-free"), json!(3), Value::Null] {
             assert!(style(Some(value)).contains(" style=normal]"));
         }
-        // Room-control messages need no reply and carry no style.
-        let mut control = event("x", "room-control", "");
-        control["speaking_style"] = json!("brief");
-        assert!(!envelope(&control).unwrap().contains("style="));
+        // Room-control messages and notes carry no person input, so no style.
+        for channel in ["room-control", "note"] {
+            let mut other = event("x", channel, "");
+            other["speaking_style"] = json!("brief");
+            assert!(!envelope(&other).unwrap().contains("style="));
+        }
     }
 
     #[test]
