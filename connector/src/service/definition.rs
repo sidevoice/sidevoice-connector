@@ -144,7 +144,7 @@ pub fn definitions(layout: &Layout) -> Result<Vec<(Job, Definition)>> {
                 program: programs.connector,
                 environment,
                 unset: layout.agent_dirs_unset(),
-                restart: Restart::Always,
+                restart: Restart::OnFailure,
                 log: layout.connector_log(),
                 runner,
                 guarded,

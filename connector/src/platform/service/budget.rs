@@ -88,7 +88,26 @@ fn save(file: &Path, restarts: &Restarts) -> io::Result<()> {
 
 /// A person or the app starts the job: a full budget again.
 pub fn reset(file: &Path) {
+    let _lock = lock(file);
     let _ = std::fs::remove_file(file);
+}
+
+/// An advisory lock on the budget, held while it is read, changed and written: the guard of a job and the app's
+/// `reset` (or a second guard, the moment a manager starts one before the old one has left) do not lose each other's
+/// writes. It is a file beside the budget, so that the budget itself can be replaced and removed; the lock goes with
+/// the handle. A lock that cannot be taken does not stop anything: the budget then is as unguarded as it was.
+fn lock(file: &Path) -> Option<std::fs::File> {
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir).ok()?;
+    }
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(file.with_extension("lock"))
+        .ok()?;
+    lock.lock().ok()?;
+    Some(lock)
 }
 
 /// Seconds since the Unix epoch.
@@ -111,9 +130,13 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = io::Result<i32>>,
 {
-    let mut restarts = load(file);
-    let admission = restarts.admit(now);
-    let _ = save(file, &restarts);
+    let (restarts, admission) = {
+        let _lock = lock(file);
+        let mut restarts = load(file);
+        let admission = restarts.admit(now);
+        let _ = save(file, &restarts);
+        (restarts, admission)
+    };
     match admission {
         Admission::Run => run().await,
         Admission::Down { retry_after } => {

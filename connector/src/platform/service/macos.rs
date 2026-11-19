@@ -353,7 +353,7 @@ struct Program {
 }
 
 /// A LaunchAgent. [`Restart::OnFailure`]: back after a crash or a non-zero exit, never after exit 0 (the core);
-/// [`Restart::Always`]: back whenever it exits (the connector). At most one start every 10 s. Output to the job's
+/// [`Restart::Always`] (no job now) is written the same. At most one start every 10 s. Output to the job's
 /// log.
 fn plist_text(job: &Job) -> String {
     let agent = Agent {
@@ -366,8 +366,7 @@ fn plist_text(job: &Job) -> String {
                 successful_exit: false,
                 crashed: true,
             },
-            // Back only after a failure, as Task Scheduler does: a job that stopped itself at the end of its budget
-            // exits 0, and `true` would start it again at once.
+            // Only a legacy job is read with this; it is written as `OnFailure`.
             Restart::Always => KeepAlive::Unless {
                 successful_exit: false,
                 crashed: true,
