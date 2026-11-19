@@ -84,15 +84,15 @@ pub(super) fn release(version: &str) -> Cow<'static, str> {
 }
 
 /// The event of a record, from its closed field list: the Sentry `event_id` is the record's id, the release the
-/// connector's version, `os.name` the one the handled errors carry (`context.os_name`) and `installation.id` the connector's own random id.
-pub fn event(record: &CrashRecord, os_name: &str, machine_id: &str) -> Event<'static> {
+/// connector's version, `os.name` the one the record was made with and `installation.id` the connector's own random id.
+pub fn event(record: &CrashRecord, machine_id: &str) -> Event<'static> {
     let time = |text: &str| {
         chrono::DateTime::parse_from_rfc3339(text).map_or(SystemTime::now(), SystemTime::from)
     };
     let tags = tags([
         ("service.name", SERVICE),
         ("os.type", record.os.as_str()),
-        ("os.name", os_name),
+        ("os.name", record.os_name.as_str()),
         ("host.arch", record.arch.as_str()),
         ("installation.id", machine_id),
     ]);
@@ -239,7 +239,7 @@ pub(super) fn drain(context: &Context, ask: Ask<'_>, dsn: &Dsn, deadline: Instan
         if !context.store.holds(&record.id) {
             continue;
         }
-        if !deliver(&agent, dsn, event(&record, context.os_name, &id)) {
+        if !deliver(&agent, dsn, event(&record, &id)) {
             warn!(
                 error.type = ConnectorError::CrashReportFailed.code(),
                 "a crash report could not be sent; it stays for the next start"
