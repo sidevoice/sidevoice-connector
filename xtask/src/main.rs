@@ -51,6 +51,7 @@ mod manifest;
 mod notices;
 mod npm;
 mod publish;
+mod remap;
 mod sentry;
 mod testbench;
 mod util;

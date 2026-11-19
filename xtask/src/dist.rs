@@ -15,6 +15,7 @@ use crate::debug_files;
 use crate::glibc;
 use crate::host::chmod;
 use crate::notices::stage_notices;
+use crate::remap;
 use crate::util::*;
 use crate::verify::verify;
 use crate::{
@@ -63,6 +64,8 @@ pub(crate) fn dist() -> Result<()> {
     if let Some(build_target) = &build_target {
         build.args(["--target", build_target]);
     }
+    // Paths of this machine out of the panic locations and the debug files (remap.rs).
+    build.args(remap::cargo_args(&repo)?);
     // The build identity the binary reports (connector/build.rs).
     let status = build
         .env("SIDEVOICE_CONNECTOR_BUILD_SHA", &source_sha)
@@ -92,6 +95,8 @@ pub(crate) fn dist() -> Result<()> {
         &built.join(release_target.exe_name(PACKAGE)),
         &binary,
     )?;
+    // The shipped binary, debug sections gone, names no directory of this machine in its panic locations (remap.rs).
+    remap::check(&binary, &repo)?;
     let mut executables = vec![entrypoint.clone()];
     if let Some(launcher) = background(target) {
         let staged = stage.join(&launcher);
