@@ -92,6 +92,16 @@ pub fn reset(file: &Path) {
     let _ = std::fs::remove_file(file);
 }
 
+/// The job is up: the mark of why it was down goes, and the starts stay counted, so a job that comes up and then
+/// crashes again still runs out of its budget.
+pub fn clear_down(file: &Path) {
+    let _lock = lock(file);
+    let mut restarts = load(file);
+    if restarts.down.take().is_some() {
+        let _ = save(file, &restarts);
+    }
+}
+
 /// An advisory lock on the budget, held while it is read, changed and written: the guard of a job and the app's
 /// `reset` (or a second guard, the moment a manager starts one before the old one has left) do not lose each other's
 /// writes. It is a file beside the budget, so that the budget itself can be replaced and removed; the lock goes with
@@ -218,6 +228,22 @@ mod tests {
         reset(&file);
         let code = guarded(&file, 1_002, &mut Vec::new(), || async { Ok(7) }).await;
         assert_eq!(code.unwrap(), 7);
+    }
+
+    #[test]
+    fn a_job_that_is_up_loses_its_down_mark_and_keeps_its_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("job.json");
+        let mut restarts = Restarts::default();
+        for _ in 0..=LIMIT {
+            restarts.admit(1_000);
+        }
+        save(&file, &restarts).unwrap();
+        assert!(load(&file).down.is_some());
+        clear_down(&file);
+        let after = load(&file);
+        assert!(after.down.is_none());
+        assert_eq!(after.starts.len(), LIMIT);
     }
 
     #[tokio::test]

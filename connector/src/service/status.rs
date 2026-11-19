@@ -339,12 +339,20 @@ pub async fn observe(layout: &Layout, connector_running: Option<bool>) -> Observ
     let service = jobs::manager(layout);
     let defined_core = installed.as_ref().is_some_and(|found| found.core);
     let defined_connector = installed.as_ref().is_some_and(|found| found.connector);
+    let ready = read_ready(layout);
+    let health = match ready.as_ref().map(|ready| &ready.endpoint) {
+        Some(endpoint) => health(endpoint, Duration::from_millis(1500)).await,
+        None => None,
+    };
     let (core_job, core_job_text, program) = if defined_core {
         let program = service.program(Job::Core.id()).await;
         let mut diagnosis = service.diagnose(Job::Core.id()).await;
         // Linux's systemd says it itself (`start-limit-hit`). launchd and Task Scheduler have no cap: the guard that
         // keeps their budget leaves its mark in a file. Same reason, so the same state on every OS.
-        if !diagnosis.job.running
+        // A core that answers is up whoever started it: a mark from before is stale, and goes.
+        if health.is_some() {
+            budget::clear_down(&layout.restarts(Job::Core));
+        } else if !diagnosis.job.running
             && diagnosis.job.reason.is_none()
             && budget::load(&layout.restarts(Job::Core)).down.is_some()
         {
@@ -357,11 +365,6 @@ pub async fn observe(layout: &Layout, connector_running: Option<bool>) -> Observ
         )
     } else {
         (None, None, None)
-    };
-    let ready = read_ready(layout);
-    let health = match ready.as_ref().map(|ready| &ready.endpoint) {
-        Some(endpoint) => health(endpoint, Duration::from_millis(1500)).await,
-        None => None,
     };
     let at = crate::logfile::timestamp();
     let core_age = match core_job
