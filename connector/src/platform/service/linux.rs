@@ -504,6 +504,8 @@ mod tests {
             restart: Restart::OnFailure,
             log: PathBuf::from("/d/core.log"),
             runner: vec![],
+            guarded: vec![],
+            budget: PathBuf::from("/d/test.restarts.json"),
         })
     }
 

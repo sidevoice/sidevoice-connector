@@ -35,6 +35,8 @@ mod imp;
 #[path = "service/launchd.rs"]
 mod launchd;
 
+pub mod budget;
+
 pub use imp::Os as Services;
 
 use super::fs::{Create, Files, Fs};
@@ -94,6 +96,12 @@ pub struct Job {
     /// The command that runs a job from its definition file ([`Service::run_job`], the file appended), for a
     /// manager that cannot set a job's environment and output itself (Task Scheduler).
     pub runner: Vec<String>,
+    /// The command that runs a program under the restart budget ([`budget`]; the budget file and `--` then the
+    /// program appended), for a manager that has no cap of its own and sets the environment and output itself
+    /// (launchd).
+    pub guarded: Vec<String>,
+    /// Where the restart budget is kept ([`budget`]): the job's starts still in the window, and why it is down.
+    pub budget: PathBuf,
 }
 
 impl Job {
@@ -109,10 +117,11 @@ impl Job {
             }
         };
         plain(self.description, "description")?;
-        for word in self.program.iter().chain(&self.runner) {
+        for word in self.program.iter().chain(&self.runner).chain(&self.guarded) {
             plain(word, "program")?;
         }
         plain(&self.log.to_string_lossy(), "log")?;
+        plain(&self.budget.to_string_lossy(), "budget")?;
         for name in self
             .environment
             .keys()
@@ -442,6 +451,7 @@ pub trait Service: Sized + Send + Sync {
                 .split_first()
                 .ok_or_else(|| io::Error::other("no program"))?;
             let log = Files::open_private(&job.log, Create::Append)?;
+            let mut said = log.try_clone()?;
             let mut command = Command::new(program);
             command
                 .args(args)
@@ -452,8 +462,32 @@ pub trait Service: Sized + Send + Sync {
             for name in &job.unset {
                 command.env_remove(name);
             }
-            let mut child = Processes::spawn_tree(command).await?;
-            Ok(child.wait().await?.code().unwrap_or(1))
+            budget::guarded(&job.budget, budget::now(), &mut said, || async move {
+                let mut child = Processes::spawn_tree(command).await?;
+                Ok(child.wait().await?.code().unwrap_or(1))
+            })
+            .await
+        }
+    }
+
+    /// Runs `program` under the restart budget in `file` ([`budget::guarded`]), as a manager that has no cap of its
+    /// own starts a job whose environment and output it sets itself (launchd): the program inherits both. Its exit
+    /// code; 0, and not run, when the budget is spent.
+    fn run_guarded(
+        file: &Path,
+        program: &[String],
+    ) -> impl Future<Output = io::Result<i32>> + Send {
+        async move {
+            let (program, args) = program
+                .split_first()
+                .ok_or_else(|| io::Error::other("no program"))?;
+            let mut command = Command::new(program);
+            command.args(args);
+            budget::guarded(file, budget::now(), &mut io::stderr(), || async move {
+                let mut child = Processes::spawn_tree(command).await?;
+                Ok(child.wait().await?.code().unwrap_or(1))
+            })
+            .await
         }
     }
 }
@@ -467,6 +501,7 @@ pub struct Stored {
     pub unset: Vec<String>,
     pub log: PathBuf,
     pub runner: Vec<String>,
+    pub budget: PathBuf,
 }
 
 impl From<&Job> for Stored {
@@ -478,6 +513,7 @@ impl From<&Job> for Stored {
             unset: job.unset.iter().map(|name| (*name).to_owned()).collect(),
             log: job.log.clone(),
             runner: job.runner.clone(),
+            budget: job.budget.clone(),
         }
     }
 }
@@ -702,6 +738,8 @@ mod tests {
             restart: Restart::OnFailure,
             log: PathBuf::from("/d/test.log"),
             runner: vec!["/r/current/sidevoice-connector".into(), "run-job".into()],
+            guarded: vec![],
+            budget: PathBuf::from("/d/test.restarts.json"),
         }
     }
 
