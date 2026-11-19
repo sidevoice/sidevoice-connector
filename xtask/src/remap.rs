@@ -167,12 +167,20 @@ mod tests {
         let first = config_args(Path::new("/build/repo"), Path::new("/home/ci/.cargo"), Path::new("/tc"));
         assert_eq!(first, config_args(Path::new("/build/repo"), Path::new("/home/ci/.cargo"), Path::new("/tc")));
         assert_eq!(first[0], "--config");
+        // The separators are the host's (`join`), as the flags are made from real paths.
+        let shown = |path: PathBuf| path.display().to_string();
+        let registry = shown(Path::new("/home/ci/.cargo").join("registry").join("src"));
+        let git = shown(Path::new("/home/ci/.cargo").join("git").join("checkouts"));
+        let rust = shown(Path::new("/tc").join("lib").join("rustlib").join("src").join("rust"));
         assert_eq!(
             first[1],
-            "target.'cfg(all())'.rustflags=[\"--remap-path-prefix=/build/repo=\",\
-             \"--remap-path-prefix=/home/ci/.cargo/registry/src=registry\",\
-             \"--remap-path-prefix=/home/ci/.cargo/git/checkouts=git\",\
-             \"--remap-path-prefix=/tc/lib/rustlib/src/rust=rust\"]"
+            format!(
+                "target.'cfg(all())'.rustflags=[{},{},{},{}]",
+                toml_string("--remap-path-prefix=/build/repo="),
+                toml_string(&format!("--remap-path-prefix={registry}=registry")),
+                toml_string(&format!("--remap-path-prefix={git}=git")),
+                toml_string(&format!("--remap-path-prefix={rust}=rust")),
+            )
         );
     }
 
