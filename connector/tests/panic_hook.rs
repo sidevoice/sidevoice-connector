@@ -158,6 +158,7 @@ fn a_panic_is_two_redacted_events_and_the_backtrace_reaches_the_file_only() {
                 "location",
                 "log_tail",
                 "os",
+                "os_name",
                 "signature",
                 "version"
             ],
