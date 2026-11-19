@@ -112,7 +112,7 @@ pub fn unidentified(client: Option<&Value>) -> String {
 /// The one pointer sentence every voice and note envelope ends with. A message after it begins a new envelope
 /// (`transcript::voice_headers`). Rules live once, in the MCP instructions and tool descriptions; a message carries
 /// data only.
-const ENVELOPE_END: &str = "Reply per the Sidevoice instructions.";
+const ENVELOPE_END: &str = "See the Sidevoice instructions.";
 
 /// How the person wants the agent to speak: the amount of content, never where it goes.
 pub const SPEAKING_STYLES: [&str; 3] = ["brief", "normal", "detailed"];
@@ -183,23 +183,30 @@ pub fn envelope(event: &Value) -> Result<String> {
     }
     tag.push_str(&unheard_tags(event.get("unheard")));
     tag.push(']');
-    let mut body = format!("{tag}\n\n");
+    let mut parts = vec![tag];
     if channel == "note" {
         if !text.is_empty() {
             bail!("a Sidevoice note cannot contain user words");
         }
     } else {
-        body.push_str(text);
+        parts.push(text.to_owned());
     }
     if let Some(notice) = event.get("notice").filter(|v| !v.is_null()) {
-        body.push_str("\n\nNotice: ");
-        body.push_str(&notice.to_string());
+        let mut block = format!("Notice: {notice}");
+        if let Some(instruction) = notice
+            .get("instruction")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            block.push('\n');
+            block.push_str(instruction);
+        }
+        parts.push(block);
     }
     if channel != "room-control" {
-        body.push_str("\n\n");
-        body.push_str(ENVELOPE_END);
+        parts.push(ENVELOPE_END.to_owned());
     }
-    Ok(body)
+    Ok(parts.join("\n\n"))
 }
 
 /// The core's one not-heard block (`unheard: {count, from, heard_up_to?}`, no reply texts) as tags: how many of the
@@ -301,7 +308,7 @@ mod tests {
         assert_eq!(injected, envelope(&pull).unwrap());
         assert_eq!(
             injected,
-            "[sidevoice channel=voice session_id=s revision=4 epoch=2 message_id=m-typed_context style=normal]\n\nalso use the second table\n\nReply per the Sidevoice instructions."
+            "[sidevoice channel=voice session_id=s revision=4 epoch=2 message_id=m-typed_context style=normal]\n\nalso use the second table\n\nSee the Sidevoice instructions."
         );
         for rule in [
             "in writing",
@@ -311,6 +318,39 @@ mod tests {
         ] {
             assert!(!injected.contains(rule), "{rule}");
         }
+    }
+
+    #[test]
+    fn a_note_without_a_notice_is_the_tag_line_and_the_pointer() {
+        let frame = json!({"channel":"note","session_id":"s","revision":4,"epoch":2,
+            "message_id":"note:9","text":""});
+        assert_eq!(
+            envelope(&frame).unwrap(),
+            "[sidevoice channel=note session_id=s revision=4 epoch=2 message_id=note:9 style=normal]\n\nSee the Sidevoice instructions."
+        );
+    }
+
+    #[test]
+    fn a_notice_instruction_is_also_its_own_plain_line() {
+        let injected = envelope(&event("typed_context", "voice", "hi")).unwrap();
+        assert!(
+            injected.contains("\nUse the current context.\n\nSee the"),
+            "{injected}"
+        );
+    }
+
+    #[test]
+    fn style_and_unheard_tags_round_trip_through_the_parser() {
+        let mut frame = event("reply_not_heard", "voice", "go on");
+        frame["speaking_style"] = json!("detailed");
+        frame["unheard"] =
+            json!({"count":2,"from":"The deploy [failed]…","heard_up_to":"The deploy"});
+        let headers = crate::adapters::transcript::voice_headers(&envelope(&frame).unwrap());
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0]["style"], "detailed");
+        assert_eq!(headers[0]["unheard"], 2);
+        assert_eq!(headers[0]["unheard_from"], "The deploy [failed]…");
+        assert_eq!(headers[0]["heard_up_to"], "The deploy");
     }
 
     #[test]
