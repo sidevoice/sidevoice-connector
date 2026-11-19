@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.21.1](https://github.com/sidevoice/sidevoice-connector/compare/v0.21.0...v0.21.1) (2026-11-19)
+
+
+### Bug Fixes
+
+* **crash-reports:** send os.name with crash reports ([#374](https://github.com/sidevoice/sidevoice-connector/issues/374)) ([20d3b03](https://github.com/sidevoice/sidevoice-connector/commit/20d3b03c75f5f53712dfed8ed0415cf6f2a1429e))
+
 ## [0.21.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.20.0...v0.21.0) (2026-11-18)
 
 
