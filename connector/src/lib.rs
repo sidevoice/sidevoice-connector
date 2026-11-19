@@ -18,6 +18,7 @@ pub mod install;
 mod link;
 mod link_error;
 mod lock;
+pub mod log_reader;
 pub mod log_safe;
 pub mod logfile;
 pub mod mcp;

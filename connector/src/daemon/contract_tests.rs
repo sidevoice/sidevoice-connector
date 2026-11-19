@@ -919,3 +919,59 @@ async fn acknowledged_pull_pages_keep_recent_routing_bounded_across_rejoin() {
     assert!(binding.input_context.lock().await.is_empty());
     assert_eq!(binding.recent_inputs.lock().await.len(), 512);
 }
+
+/// The core's `logs.read` over the link: the connector's own log in pages, in the shapes the core maps to its statuses,
+/// and a read adds nothing to the log it reads.
+#[tokio::test]
+async fn the_core_reads_the_connector_log_over_the_link_and_a_read_writes_nothing() {
+    let scratch = crate::test_support::temp_dir("contract-logs");
+    let link = Link::new();
+    let core = link.attached().await;
+    play_core(link.clone(), core);
+    let (daemon, _frames) = daemon(&scratch, link);
+    let log = daemon.profile.data.join("connector.log");
+    crate::logfile::append_line(&log, "one");
+    crate::logfile::append_line(&log, "two");
+    let before = std::fs::read(&log).unwrap();
+
+    let tail = daemon
+        .handle_incoming("logs.read", &json!({"limit": 1}))
+        .await;
+    assert_eq!(tail["lines"][0]["text"], "two", "{tail}");
+    assert_eq!(tail["more"], false, "{tail}");
+    let cursor = tail["cursor"].as_str().unwrap().to_owned();
+    crate::logfile::append_line(&log, "three");
+    let next = daemon
+        .handle_incoming(
+            "logs.read",
+            &json!({"after": cursor, "limit": 10, "future": 1}),
+        )
+        .await;
+    assert_eq!(next["lines"][0]["text"], "three", "{next}");
+
+    for (params, key) in [
+        (json!({"limit": 0}), "logs.request_invalid"),
+        (json!({"limit": 1001}), "logs.request_invalid"),
+        (json!({"limit": "1"}), "logs.request_invalid"),
+        (json!({"after": 5}), "logs.request_invalid"),
+        (json!({"after": "garbage"}), "logs.request_invalid"),
+        (
+            json!({"after": format!("{:016x}.99999", 1)}),
+            "logs.cursor_expired",
+        ),
+    ] {
+        let refused = daemon.handle_incoming("logs.read", &params).await;
+        assert_eq!(refused, json!({"error":{"key":key}}), "{params}");
+    }
+    let unreadable_dir = scratch.path().join("elsewhere");
+    std::fs::create_dir(&unreadable_dir).unwrap();
+    assert_eq!(
+        crate::log_reader::answer(std::slice::from_ref(&unreadable_dir), &json!({})),
+        json!({"error":{"key":"logs.unreadable"}}),
+        "a directory where a log should be"
+    );
+    // The reads above wrote nothing to the log: its bytes are the lines written by the test, nothing else.
+    let after = std::fs::read(&log).unwrap();
+    assert_eq!(&after[..before.len()], &before[..]);
+    assert_eq!(&after[before.len()..], b"three\n");
+}
