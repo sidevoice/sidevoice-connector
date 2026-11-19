@@ -65,7 +65,7 @@ pub(crate) fn dist() -> Result<()> {
         build.args(["--target", build_target]);
     }
     // Paths of this machine out of the panic locations and the debug files (remap.rs).
-    build.args(remap::cargo_args(&repo)?);
+    build.args(remap::cargo_args(&repo, &repo)?);
     // The build identity the binary reports (connector/build.rs).
     let status = build
         .env("SIDEVOICE_CONNECTOR_BUILD_SHA", &source_sha)
@@ -105,6 +105,8 @@ pub(crate) fn dist() -> Result<()> {
             &read(&built.join(release_target.exe_name(BACKGROUND_BIN)))?,
         )?;
         chmod(&staged, 0o755)?;
+        // The launcher is built with the same flags: it names no directory of this machine either.
+        remap::check(&staged, &repo)?;
         executables.push(launcher);
     }
     write(&stage.join("LICENSE"), &read(&repo.join("LICENSE"))?)?;
