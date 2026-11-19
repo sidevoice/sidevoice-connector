@@ -66,6 +66,9 @@ pub struct Image {
     pub code_id: Option<String>,
 }
 
+/// The values of `os.name` the connector writes (`logfile::Resource`): any other is not ours and the record is not taken.
+const OS_NAMES: [&str; 3] = ["macOS", "Windows", "Linux"];
+
 /// One crash, or the several of one signature (`count`, `first_at`, `last_at`). Exactly these fields are stored and sent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CrashRecord {
@@ -74,6 +77,8 @@ pub struct CrashRecord {
     pub id: String,
     pub version: String,
     pub os: String,
+    /// OpenTelemetry's `os.name`, taken when the panic happened like `os` and `arch`.
+    pub os_name: String,
     pub arch: String,
     /// RFC 3339, UTC, milliseconds.
     pub first_at: String,
@@ -95,6 +100,7 @@ pub struct CrashRecord {
 pub struct Panic<'a> {
     pub version: &'a str,
     pub os: &'a str,
+    pub os_name: &'a str,
     pub arch: &'a str,
     pub at: DateTime<Utc>,
     /// The payload when it is a `&'static str`; `None` for anything formatted.
@@ -122,6 +128,7 @@ impl CrashRecord {
             id: Uuid::new_v4().to_string(),
             version: panic.version.to_owned(),
             os: panic.os.to_owned(),
+            os_name: panic.os_name.to_owned(),
             arch: panic.arch.to_owned(),
             first_at: at.clone(),
             last_at: at,
@@ -156,6 +163,7 @@ impl CrashRecord {
             id: text(&value["id"])?,
             version: text(&value["version"])?,
             os: text(&value["os"])?,
+            os_name: text(&value["os_name"])?,
             arch: text(&value["arch"])?,
             first_at: text(&value["first_at"])?,
             last_at: text(&value["last_at"])?,
@@ -212,6 +220,7 @@ impl CrashRecord {
             || !token(&record.os, 32, |c| {
                 c.is_ascii_alphanumeric() || "_-".contains(c)
             })
+            || !OS_NAMES.contains(&record.os_name.as_str())
             || !token(&record.arch, 32, |c| {
                 c.is_ascii_alphanumeric() || "_-".contains(c)
             })

@@ -243,6 +243,7 @@ fn write(
         Panic {
             version: crate::identity::VERSION,
             os: context.os,
+            os_name: context.os_name,
             arch: context.arch,
             at: crashed.into(),
             literal,
