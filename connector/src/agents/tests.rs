@@ -2575,7 +2575,7 @@ async fn codex_delivery_steers_the_running_turn_when_the_version_allows() {
     assert_eq!(steer["params"]["clientUserMessageId"], "m-steer");
     let text = steer["params"]["input"][0]["text"].as_str().unwrap();
     assert!(
-        text.contains("\"message_id\":\"m-steer\"") && text.contains("hola"),
+        text.contains("message_id=m-steer") && text.contains("hola"),
         "{text}"
     );
 }
@@ -2622,7 +2622,7 @@ async fn codex_delivery_queues_when_the_steer_is_refused() {
     let queued = fs::read_to_string(calls).unwrap();
     assert!(queued.starts_with("queue\n--thread\nt-1\n--message\n"));
     assert!(
-        queued.contains("\"message_id\":\"m-refused\""),
+        queued.contains("message_id=m-refused"),
         "same message, same id"
     );
     daemon.await.unwrap();

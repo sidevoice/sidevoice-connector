@@ -109,10 +109,43 @@ pub fn unidentified(client: Option<&Value>) -> String {
     format!("Cannot tell which conversation this is: {detected}. Sidevoice joins conversations of {SUPPORTED}.")
 }
 
-/// The sentence every voice and note envelope ends with. A message after it begins a new envelope (`transcript::voice_headers`).
-const ENVELOPE_END: &str = " Treat this message ID as stable: a redelivery is not new input.";
+/// The one pointer sentence every voice and note envelope ends with. A message after it begins a new envelope
+/// (`transcript::voice_headers`). Rules live once, in the MCP instructions and tool descriptions; a message carries
+/// data only.
+const ENVELOPE_END: &str = "Reply per the Sidevoice instructions.";
 
-/// One agent-visible envelope for both injected input and get_messages.
+/// How the person wants the agent to speak: the amount of content, never where it goes.
+pub const SPEAKING_STYLES: [&str; 3] = ["brief", "normal", "detailed"];
+/// The style until the app sends one.
+pub const DEFAULT_SPEAKING_STYLE: &str = "normal";
+
+/// The event's `speaking_style` when it is one of [`SPEAKING_STYLES`], else the default.
+fn speaking_style(event: &Value) -> &'static str {
+    let asked = event.get("speaking_style").and_then(Value::as_str);
+    SPEAKING_STYLES
+        .into_iter()
+        .find(|style| Some(*style) == asked)
+        .unwrap_or(DEFAULT_SPEAKING_STYLE)
+}
+
+/// A tag value: bare when it is a plain token, else a JSON string with `[` escaped so that the text can never read
+/// as the start of another tag.
+fn tag_value(value: &str) -> String {
+    let plain = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_:.@/+".contains(c));
+    if plain {
+        value.to_owned()
+    } else {
+        serde_json::to_string(value)
+            .unwrap_or_default()
+            .replace('[', "\\u005b")
+    }
+}
+
+/// One agent-visible envelope for both injected input and get_messages: a key=value tag line (data only), the
+/// person's words, the core's notice if any, and one pointer sentence.
 pub fn envelope(event: &Value) -> Result<String> {
     let channel = match event.get("channel").and_then(Value::as_str) {
         Some("note") => "note",
@@ -139,108 +172,58 @@ pub fn envelope(event: &Value) -> Result<String> {
         .get("text")
         .and_then(Value::as_str)
         .context("text required")?;
-    let header = json!({"channel":channel,"session_id":session_id,"revision":revision,
-        "epoch":epoch,"message_id":message_id});
-    let mut body = format!("{}\n\n", header);
+    let mut tag = format!(
+        "[sidevoice channel={channel} session_id={} revision={revision} epoch={epoch} message_id={}",
+        tag_value(session_id),
+        tag_value(message_id)
+    );
+    if channel != "room-control" {
+        tag.push_str(" style=");
+        tag.push_str(speaking_style(event));
+    }
+    tag.push_str(&unheard_tags(event.get("unheard")));
+    tag.push(']');
+    let mut body = format!("{tag}\n\n");
     if channel == "note" {
         if !text.is_empty() {
             bail!("a Sidevoice note cannot contain user words");
         }
-        body.push_str(
-            "[Sidevoice] A note from Sidevoice; the person sent no words in this message.",
-        );
     } else {
         body.push_str(text);
     }
     if let Some(notice) = event.get("notice").filter(|v| !v.is_null()) {
-        body.push_str("\n\n[Sidevoice] Notice: ");
+        body.push_str("\n\nNotice: ");
         body.push_str(&notice.to_string());
-        if let Some(instruction) = notice.get("instruction").and_then(Value::as_str) {
-            body.push_str("\n[Sidevoice] ");
-            body.push_str(instruction);
-        }
-    }
-    if let Some(block) = unheard_block(event.get("unheard"))? {
-        body.push_str("\n\n");
-        body.push_str(&block);
     }
     if channel != "room-control" {
-        let say = format!(
-            "voice_say (session_id {}, revision {revision}, epoch {epoch})",
-            serde_json::to_string(session_id)?
-        );
-        let kind = event
-            .get("notice")
-            .and_then(|notice| notice.get("kind"))
-            .and_then(Value::as_str);
         body.push_str("\n\n");
-        body.push_str(&reply_rule(channel, kind, &say));
         body.push_str(ENVELOPE_END);
     }
     Ok(body)
 }
 
-/// The core's one not-heard block (`unheard: {count, from, heard_up_to?}`, no reply texts) as one line for the agent:
-/// how many of its last replies the person did not hear, from which one, and how far that first one was heard. None
-/// without a positive count.
-fn unheard_block(unheard: Option<&Value>) -> Result<Option<String>> {
+/// The core's one not-heard block (`unheard: {count, from, heard_up_to?}`, no reply texts) as tags: how many of the
+/// agent's last replies the person did not hear, from which one, and how far that first one was heard. Empty without
+/// a positive count.
+fn unheard_tags(unheard: Option<&Value>) -> String {
     let Some(unheard) = unheard.filter(|unheard| !unheard.is_null()) else {
-        return Ok(None);
+        return String::new();
     };
     let count = unheard.get("count").and_then(Value::as_u64).unwrap_or(0);
     if count == 0 {
-        return Ok(None);
+        return String::new();
     }
-    let from = unheard
-        .get("from")
-        .and_then(Value::as_str)
-        .filter(|from| !from.is_empty());
-    let heard = unheard
-        .get("heard_up_to")
-        .and_then(Value::as_str)
-        .filter(|heard| !heard.is_empty());
-    let quote = |text: &str| serde_json::to_string(text);
-    let mut line = if count == 1 {
-        match (from, heard) {
-            (Some(from), Some(heard)) => format!(
-                "[Sidevoice] The person did not hear the end of your last reply, which began {}: they heard up to {}",
-                quote(from)?,
-                quote(heard)?
-            ),
-            (Some(from), None) => format!(
-                "[Sidevoice] The person did not hear your last reply, which began {}",
-                quote(from)?
-            ),
-            (None, _) => "[Sidevoice] The person did not hear your last reply".to_owned(),
+    let mut tags = format!(" unheard={count}");
+    for (key, field) in [("unheard_from", "from"), ("heard_up_to", "heard_up_to")] {
+        if let Some(text) = unheard
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            tags.push_str(&format!(" {key}={}", tag_value(text)));
         }
-    } else {
-        let mut line = format!("[Sidevoice] The person did not hear your last {count} replies");
-        if let Some(from) = from {
-            line.push_str(&format!(", the first of which began {}", quote(from)?));
-            if let Some(heard) = heard {
-                line.push_str(&format!(" (they heard that one up to {})", quote(heard)?));
-            }
-        }
-        line
-    };
-    line.push('.');
-    Ok(Some(line))
-}
-
-/// When and whether to answer. Only the content of the person's message decides whether; a note
-/// says when the agent can speak again, never whether it should.
-fn reply_rule(channel: &str, kind: Option<&str>, say: &str) -> String {
-    match (channel, kind) {
-        ("note", Some("turn_empty" | "user_returned")) => format!(
-            "[Sidevoice] This note tells you when to speak again, not whether: the person can hear you now. If you still owe them an answer (a refused or unheard reply, or a result), give it now with {say}, with what is new and relevant at this moment, in fresh words, without saying it was missed."
-        ),
-        ("note", _) => format!(
-            "[Sidevoice] This note tells you when to speak again, not whether: what the person asked decides that. Use {say} for your next spoken reply."
-        ),
-        _ => format!(
-            "[Sidevoice] Only its content decides whether to answer by voice: if it asks or needs something, answer with {say}, short, with the details in writing."
-        ),
     }
+    tags
 }
 
 #[cfg(test)]
@@ -256,31 +239,31 @@ mod tests {
                 "related_message_id":"m-original"}})
     }
 
-    /// The core's one not-heard block becomes one line: how many replies, from which, how far the first was heard; the
-    /// same pushed or pulled, after the notice, and never more than the block says.
+    /// The core's not-heard block becomes tags on the tag line: how many replies, from which, how far the first was
+    /// heard; the same pushed or pulled, and never more than the block says.
     #[test]
-    fn the_not_heard_block_is_one_line_with_no_reply_texts() {
+    fn the_not_heard_block_is_tags_with_no_reply_texts() {
         let cases = [
             (
                 "voice",
                 "Wait",
                 json!({"count":1,"from":"The deploy failed on…","heard_up_to":"The deploy","history_id":"h"}),
-                "[Sidevoice] The person did not hear the end of your last reply, which began \"The deploy failed on…\": they heard up to \"The deploy\".",
+                " unheard=1 unheard_from=\"The deploy failed on…\" heard_up_to=\"The deploy\"]",
             ),
             (
                 "voice",
                 "Next",
                 json!({"count":3,"from":"é🐙…","heard_up_to":"é🐙","history_id":"h"}),
-                "[Sidevoice] The person did not hear your last 3 replies, the first of which began \"é🐙…\" (they heard that one up to \"é🐙\").",
+                " unheard=3 unheard_from=\"é🐙…\" heard_up_to=\"é🐙\"]",
             ),
             (
                 "note",
                 "",
                 json!({"count":2,"from":"Done…","history_id":"h","added_later":{"nested":true}}),
-                "[Sidevoice] The person did not hear your last 2 replies, the first of which began \"Done…\".",
+                " unheard=2 unheard_from=\"Done…\"]",
             ),
         ];
-        for (channel, words, unheard, line) in cases {
+        for (channel, words, unheard, tags) in cases {
             let kind = if channel == "note" {
                 "user_returned"
             } else {
@@ -293,22 +276,22 @@ mod tests {
             pull["arrival_time"] = json!(1792000000);
             let injected = envelope(&push).unwrap();
             assert_eq!(injected, envelope(&pull).unwrap());
-            assert!(injected.contains(line), "{injected}");
-            assert_eq!(injected.matches("did not hear").count(), 1, "{injected}");
-            assert!(injected.find("Notice:").unwrap() < injected.find(line).unwrap());
-            assert!(injected.find(line).unwrap() < injected.find("voice_say (session_id").unwrap());
+            let tag_line = injected.lines().next().unwrap();
+            assert!(tag_line.ends_with(tags), "{injected}");
+            assert_eq!(injected.matches("unheard=").count(), 1, "{injected}");
+            assert!(!injected.contains("did not hear"));
             assert!(!injected.contains("Reply starting"));
         }
-        // Nothing to tell: no line.
+        // Nothing to tell: no tag.
         for unheard in [json!({"count":0}), Value::Null] {
             let mut frame = event("turn_empty", "note", "");
             frame["unheard"] = unheard;
-            assert!(!envelope(&frame).unwrap().contains("did not hear"));
+            assert!(!envelope(&frame).unwrap().contains("unheard"));
         }
     }
 
     #[test]
-    fn typed_context_keeps_its_epoch_and_its_content_decides_the_reply() {
+    fn a_message_carries_data_and_one_pointer_never_rules() {
         let mut push = event("typed_context", "voice", "also use the second table");
         push.as_object_mut().unwrap().remove("notice");
         let mut pull = push.clone();
@@ -316,13 +299,41 @@ mod tests {
         pull["arrival_time"] = json!(1792000000);
         let injected = envelope(&push).unwrap();
         assert_eq!(injected, envelope(&pull).unwrap());
-        let header: Value = serde_json::from_str(injected.lines().next().unwrap()).unwrap();
-        assert_eq!(header["epoch"], 2);
-        assert!(injected.contains("\n\nalso use the second table\n\n"));
-        assert!(injected.contains(
-            "Only its content decides whether to answer by voice: if it asks or needs something, answer with voice_say (session_id \"s\", revision 4, epoch 2), short, with the details in writing."
-        ));
-        assert!(!injected.contains("If a reply is appropriate"));
+        assert_eq!(
+            injected,
+            "[sidevoice channel=voice session_id=s revision=4 epoch=2 message_id=m-typed_context style=normal]\n\nalso use the second table\n\nReply per the Sidevoice instructions."
+        );
+        for rule in [
+            "in writing",
+            "short",
+            "Treat this message ID",
+            "[Sidevoice]",
+        ] {
+            assert!(!injected.contains(rule), "{rule}");
+        }
+    }
+
+    #[test]
+    fn the_style_tag_defaults_and_follows_the_app() {
+        let style = |value: Option<Value>| {
+            let mut frame = event("x", "voice", "hi");
+            if let Some(value) = value {
+                frame["speaking_style"] = value;
+            }
+            envelope(&frame).unwrap().lines().next().unwrap().to_owned()
+        };
+        assert!(style(None).contains(" style=normal]"));
+        for value in ["brief", "normal", "detailed"] {
+            assert!(style(Some(json!(value))).contains(&format!(" style={value}]")));
+        }
+        // An unknown or malformed value is the default, never passed through.
+        for value in [json!("hands-free"), json!(3), Value::Null] {
+            assert!(style(Some(value)).contains(" style=normal]"));
+        }
+        // Room-control messages need no reply and carry no style.
+        let mut control = event("x", "room-control", "");
+        control["speaking_style"] = json!("brief");
+        assert!(!envelope(&control).unwrap().contains("style="));
     }
 
     #[test]
@@ -330,12 +341,12 @@ mod tests {
         let mut note = event("turn_empty", "note", "invented words");
         assert!(envelope(&note).is_err());
         note["text"] = json!("");
-        assert!(envelope(&note).unwrap().contains("person sent no words"));
+        assert!(envelope(&note).unwrap().contains("channel=note"));
         note["channel"] = json!("from-the-future");
         note["text"] = json!("words");
         assert_eq!(
             envelope(&note).unwrap().lines().next().unwrap(),
-            r#"{"channel":"voice","epoch":2,"message_id":"m-turn_empty","revision":4,"session_id":"s"}"#
+            "[sidevoice channel=voice session_id=s revision=4 epoch=2 message_id=m-turn_empty style=normal]"
         );
     }
 

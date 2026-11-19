@@ -55,10 +55,7 @@ fn assert_unheard_envelope(message: &Value) {
         unheard.get("replies").is_none(),
         "no reply texts: {message}"
     );
-    assert!(
-        envelope.contains("[Sidevoice] The person did not hear"),
-        "{message}"
-    );
+    assert!(envelope.contains(" unheard="), "{message}");
     assert!(
         envelope.contains(&serde_json::to_string(&unheard["from"]).unwrap()),
         "{message}"
