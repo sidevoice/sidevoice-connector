@@ -51,6 +51,9 @@ mod manifest;
 mod notices;
 mod npm;
 mod publish;
+// One file for three repositories, each with its own rustfmt settings: not reformatted.
+#[rustfmt::skip]
+mod remap;
 mod sentry;
 mod testbench;
 mod util;
