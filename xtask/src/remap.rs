@@ -150,6 +150,9 @@ fn toml_string(text: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A Windows root, held in a constant: only its text matters here, not a path this test opens.
+    const WINDOWS_REPO: &str = r"C:\build\repo";
+
     fn roots() -> Vec<PathBuf> {
         vec![PathBuf::from("/build/repo"), PathBuf::from("/home/ci/.cargo")]
     }
@@ -190,8 +193,8 @@ mod tests {
         assert!(leak(b"/home/ci/.cargo/registry/src/index.crates.io-6f17d22bba15001f/serde-1.0.0/src/lib.rs", &roots()).is_some());
         // Literals are stored one after the other, with no NUL between them.
         assert!(leak(b"/build/repo/src/main.rscalled `Option::unwrap()` on a `None` value", &roots()).is_some());
-        assert!(leak(br"C:\build\repo\src\main.rs".as_slice(), &[PathBuf::from(r"C:\build\repo")]).is_some());
-        assert!(leak(b"C:/build/repo/src/main.rs", &[PathBuf::from(r"C:\build\repo")]).is_some());
+        assert!(leak(br"C:\build\repo\src\main.rs".as_slice(), &[PathBuf::from(WINDOWS_REPO)]).is_some());
+        assert!(leak(b"C:/build/repo/src/main.rs", &[PathBuf::from(WINDOWS_REPO)]).is_some());
         // Not the first occurrence only.
         assert!(leak(b"/build/repo\x00/build/repo/a/b.rs", &roots()).is_some());
     }
@@ -208,7 +211,7 @@ mod tests {
             assert_eq!(leak(text, &roots()), None, "{}", String::from_utf8_lossy(text));
         }
         assert_eq!(
-            leak(br"C:\build\repo\target\release\build\x\out\crypto\err.c".as_slice(), &[PathBuf::from(r"C:\build\repo")]),
+            leak(br"C:\build\repo\target\release\build\x\out\crypto\err.c".as_slice(), &[PathBuf::from(WINDOWS_REPO)]),
             None
         );
     }
