@@ -353,6 +353,20 @@ mod tests {
     }
 
     #[test]
+    fn a_call_ended_note_renders_its_notice_instruction_line() {
+        let mut frame = event("call_ended", "note", "");
+        frame["notice"]["instruction"] =
+            json!("Nobody is listening now: do not speak. Tell them when they are back.");
+        let out = envelope(&frame).unwrap();
+        assert!(
+            out.contains(
+                "\nNobody is listening now: do not speak. Tell them when they are back.\n\nSee the"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn style_and_unheard_tags_round_trip_through_the_parser() {
         let mut frame = event("reply_not_heard", "voice", "go on");
         frame["speaking_style"] = json!("detailed");
