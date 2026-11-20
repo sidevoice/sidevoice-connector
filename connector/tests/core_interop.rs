@@ -47,6 +47,21 @@ fn confirm_hearing(
     call.report_hearing(&history_id, utterance_id, outcome, heard_chars);
 }
 
+/// A tag value as the connector writes it: bare when plain, JSON-quoted otherwise.
+fn tag_value(value: &str) -> String {
+    let plain = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_:.@/+".contains(c));
+    if plain {
+        value.to_owned()
+    } else {
+        serde_json::to_string(value)
+            .unwrap()
+            .replace('[', "\\u005b")
+    }
+}
+
 fn assert_unheard_envelope(message: &Value) {
     let envelope = message["envelope"].as_str().unwrap();
     let unheard = &message["unheard"];
@@ -55,17 +70,14 @@ fn assert_unheard_envelope(message: &Value) {
         unheard.get("replies").is_none(),
         "no reply texts: {message}"
     );
+    assert!(envelope.contains(" unheard="), "{message}");
     assert!(
-        envelope.contains("[Sidevoice] The person did not hear"),
-        "{message}"
-    );
-    assert!(
-        envelope.contains(&serde_json::to_string(&unheard["from"]).unwrap()),
+        envelope.contains(&tag_value(unheard["from"].as_str().unwrap())),
         "{message}"
     );
     if let Some(heard) = unheard.get("heard_up_to") {
         assert!(
-            envelope.contains(&serde_json::to_string(heard).unwrap()),
+            envelope.contains(&tag_value(heard.as_str().unwrap())),
             "{message}"
         );
     }
@@ -443,13 +455,7 @@ fn t02c_t02d_open_turn_refusal_is_terminal_and_empty_notice_is_pullable() {
     assert_eq!(note["channel"], "note", "{note}");
     assert_eq!(note["text"], "", "{note}");
     let envelope = note["envelope"].as_str().unwrap();
-    assert!(envelope.contains("person sent no words"), "{envelope}");
-    assert!(
-        envelope.contains(
-            "This note tells you when to speak again, not whether: the person can hear you now."
-        ),
-        "{envelope}"
-    );
+    assert!(envelope.contains("The person said nothing."), "{envelope}");
     let after = mcp.tool("voice_say", args);
     assert_eq!(after["status"], "rejected", "{after}");
     assert_eq!(after["reason"], "user_speaking", "{after}");
@@ -1131,7 +1137,7 @@ fn t02c_t02d_refusal_reaches_the_caller_and_words_or_empty_input_in_both_modes()
                     message["envelope"]
                         .as_str()
                         .unwrap()
-                        .contains("Only its content decides whether to answer by voice"),
+                        .contains("See the Sidevoice instructions."),
                     "{message}"
                 );
             } else {
@@ -1139,10 +1145,6 @@ fn t02c_t02d_refusal_reaches_the_caller_and_words_or_empty_input_in_both_modes()
                 assert_eq!(message["notice"]["kind"], "turn_empty", "{message}");
                 let envelope = message["envelope"].as_str().unwrap();
                 assert!(envelope.contains("Resend what you meant"), "{envelope}");
-                assert!(
-                    envelope.contains("give it now with voice_say (session_id"),
-                    "{envelope}"
-                );
             }
             let history = core_json(
                 &profile.core_endpoint(),
