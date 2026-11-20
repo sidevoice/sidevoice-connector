@@ -182,6 +182,17 @@ pub fn envelope(event: &Value) -> Result<String> {
     if channel == "voice" {
         tag.push_str(" style=");
         tag.push_str(speaking_style(event));
+        // Words the person said while the agent could not hear them: delivered later, with when they were said.
+        if event.get("late").and_then(Value::as_bool) == Some(true) {
+            if let Some(said_at) = event
+                .get("said_at")
+                .and_then(Value::as_str)
+                .filter(|said_at| !said_at.is_empty())
+            {
+                tag.push_str(" late=1 said_at=");
+                tag.push_str(&tag_value(said_at));
+            }
+        }
     }
     tag.push_str(&unheard_tags(event.get("unheard")));
     tag.push(']');
@@ -377,6 +388,34 @@ mod tests {
             let mut other = event("x", channel, "");
             other["speaking_style"] = json!("brief");
             assert!(!envelope(&other).unwrap().contains("style="));
+        }
+    }
+
+    #[test]
+    fn late_words_carry_when_they_were_said_and_read_back() {
+        let mut late = event("x", "voice", "hi");
+        late["late"] = json!(true);
+        late["said_at"] = json!("2026-11-20T10:15:30.250+01:00");
+        let text = envelope(&late).unwrap();
+        assert_eq!(
+            text.lines().next().unwrap(),
+            "[sidevoice channel=voice session_id=s revision=4 epoch=2 message_id=m-x style=normal late=1 said_at=2026-11-20T10:15:30.250+01:00]"
+        );
+        let headers = super::transcript::voice_headers(&text);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0]["late"], "1");
+        assert_eq!(headers[0]["said_at"], "2026-11-20T10:15:30.250+01:00");
+        // Not late, or late without a time: no tags.
+        for frame in [
+            json!({"late": false, "said_at": "2026-11-20T10:15:30Z"}),
+            json!({"late": true}),
+        ] {
+            let mut other = event("x", "voice", "hi");
+            other
+                .as_object_mut()
+                .unwrap()
+                .extend(frame.as_object().unwrap().clone());
+            assert!(!envelope(&other).unwrap().contains("late="));
         }
     }
 
