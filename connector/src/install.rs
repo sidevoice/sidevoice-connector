@@ -193,6 +193,10 @@ const OWNED: &[&str] = &[
     "node-stopped.json",
     "outbox.json",
     "service",
+    "sidevoice-connector.restarts.json",
+    "sidevoice-connector.restarts.lock",
+    "sidevoice-core.restarts.json",
+    "sidevoice-core.restarts.lock",
 ];
 
 /// The package being installed: its root (`bin/`, `connector.json`, `core/`), its binary and the version it is.
