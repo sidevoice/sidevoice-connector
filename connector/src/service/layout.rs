@@ -239,6 +239,11 @@ impl Layout {
         self.data.join("core.stderr.log")
     }
 
+    /// Where a job's restart budget is kept (`platform::service::budget`).
+    pub fn restarts(&self, job: super::Job) -> PathBuf {
+        self.data.join(format!("{}.restarts.json", job.id().name))
+    }
+
     pub fn connector_log(&self) -> PathBuf {
         self.data.join("connector.log")
     }

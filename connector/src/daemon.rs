@@ -73,6 +73,8 @@ pub struct Daemon {
     activity_generation: AtomicU64,
     managed: bool,
     shutdown: watch::Sender<bool>,
+    /// Set when the daemon stopped because its state or guard file could not be written: the run then ends in failure.
+    storage_failed: AtomicBool,
     closed_by_client: Mutex<HashMap<String, String>>,
     /// Voluntary agent exits waiting to be replayed to Core after a transport or Core restart.
     left_by_agent: Mutex<HashMap<String, Value>>,
@@ -167,6 +169,7 @@ impl Daemon {
             activity_generation: AtomicU64::new(0),
             managed,
             shutdown,
+            storage_failed: AtomicBool::new(false),
             closed_by_client: Mutex::new(closed_by_client),
             left_by_agent: Mutex::new(left_by_agent),
             latest_closed: Mutex::new(None),
@@ -387,7 +390,7 @@ impl Daemon {
         }
         if let Err(error) = self.arm_conversation_guard() {
             self.mark_state_write_failed();
-            let _ = self.shutdown.send(true);
+            self.fail_storage();
             return Err(error);
         }
         self.bindings.lock().await.remove(&binding.client_ref);
@@ -488,8 +491,15 @@ impl Daemon {
                 error.type = ConnectorError::of(&error, ConnectorError::ConversationGuardFailed),
                 "the emergency conversation guard failed; the connector is shutting down"
             );
-            let _ = self.shutdown.send(true);
+            self.fail_storage();
         }
+    }
+
+    /// Stops the daemon for a state or guard file it cannot write; `run` then ends in failure, so that the manager
+    /// starts it again (within its budget) rather than leaving it down.
+    fn fail_storage(&self) {
+        self.storage_failed.store(true, Ordering::Release);
+        let _ = self.shutdown.send(true);
     }
 
     async fn persist_conversation_state(&self) -> bool {
@@ -2330,5 +2340,33 @@ mod tests {
             ["one"],
             "m-1 was handed over; m-2 was already"
         );
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_cannot_write_its_guard_stops_and_asks_to_exit_in_failure() {
+        let scratch = crate::test_support::temp_dir("guard-failure");
+        let profile = Profile::for_test(scratch.path(), &crate::adapters::Registry::homes());
+        let (replay_tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (shutdown, stop) = tokio::sync::watch::channel(false);
+        let daemon = Daemon::new(
+            profile,
+            crate::link::Link::new(),
+            replay_tx,
+            Registry::new(Vec::new()),
+            false,
+            shutdown,
+        )
+        .unwrap();
+        assert!(!daemon.storage_failed.load(Ordering::Acquire));
+        // A guard that cannot be written: its lock is poisoned.
+        let poisoner = daemon.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.conversation_guard.lock().unwrap();
+            panic!("poison");
+        })
+        .join();
+        daemon.mark_state_write_failed();
+        assert!(daemon.storage_failed.load(Ordering::Acquire));
+        assert!(*stop.borrow(), "the daemon is told to stop");
     }
 }

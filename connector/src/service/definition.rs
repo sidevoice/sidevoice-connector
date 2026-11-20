@@ -25,6 +25,10 @@ use std::path::Path;
 /// output itself (`main.rs`, `platform::service::Service::run_job`).
 pub const RUN_JOB: &str = "run-job";
 
+/// The subcommand that runs a program under the restart budget, for a manager that sets the environment and output
+/// itself but has no cap on restarts (`platform::service::Service::run_guarded`).
+pub const RUN_GUARDED: &str = "run-guarded";
+
 /// What each job runs: the core in the selected release, the connector as `install.json`'s `command` says.
 pub struct Programs {
     pub core: Vec<String>,
@@ -112,7 +116,9 @@ pub fn definitions(layout: &Layout) -> Result<Vec<(Job, Definition)>> {
             .connector_command()
             .ok_or_else(|| Failure::keyed("service.no-installation", json!({})))?,
     );
+    let mut guarded = runner.clone();
     runner.push(RUN_JOB.into());
+    guarded.push(RUN_GUARDED.into());
     let environment = environment(layout);
     let definitions = vec![
         (
@@ -126,6 +132,8 @@ pub fn definitions(layout: &Layout) -> Result<Vec<(Job, Definition)>> {
                 restart: Restart::OnFailure,
                 log: layout.core_output(),
                 runner: runner.clone(),
+                guarded: guarded.clone(),
+                budget: layout.restarts(Job::Core),
             },
         ),
         (
@@ -136,9 +144,11 @@ pub fn definitions(layout: &Layout) -> Result<Vec<(Job, Definition)>> {
                 program: programs.connector,
                 environment,
                 unset: layout.agent_dirs_unset(),
-                restart: Restart::Always,
+                restart: Restart::OnFailure,
                 log: layout.connector_log(),
                 runner,
+                guarded,
+                budget: layout.restarts(Job::Connector),
             },
         ),
     ];

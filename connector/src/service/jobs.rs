@@ -253,6 +253,10 @@ pub async fn start(
         // A core about to start again: its last failure report is about a start that is over.
         let _ = std::fs::remove_file(layout.core_failure());
     }
+    // A start by a person or the app: a full restart budget again.
+    for job in jobs {
+        crate::platform::service::budget::reset(&layout.restarts(*job));
+    }
     match manager
         .start(&ids(jobs), &ids(changed), restart, login)
         .await

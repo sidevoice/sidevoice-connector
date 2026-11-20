@@ -263,5 +263,12 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
     if link_exited {
         bail!("Core authentication was refused or its link task exited");
     }
+    if daemon.storage_failed.load(Ordering::Acquire) {
+        tracing::error!(
+            error.type = crate::error::ConnectorError::ConversationGuardFailed.code(),
+            "the connector stopped because it could not write its conversation files; it exits with an error so that its service starts it again"
+        );
+        bail!("the conversation state could not be written");
+    }
     Ok(())
 }
