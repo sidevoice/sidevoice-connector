@@ -385,7 +385,11 @@ fn a_cursor_survives_the_copy_and_truncate_the_connector_rotates_by() {
     // Mid-rotation: the copy is there and the file has not been truncated yet.
     let (_temp, log, files) = self::log();
     append(&log, &numbered(0, 5));
-    fs::copy(&log, log.with_extension("log.1")).unwrap();
+    // A copy made as the writer makes it (private); a plain `fs::copy` is not private on Windows.
+    append(
+        &log.with_extension("log.1"),
+        &fs::read_to_string(&log).unwrap(),
+    );
     let page = read(&files, None, 100).unwrap();
     assert_eq!(page.lines.len(), 5, "one generation, not two");
     // A rotation in a later generation that was already read through.
