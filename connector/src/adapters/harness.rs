@@ -351,8 +351,11 @@ mod tests {
         sources(&src, &mut files);
         let mut leaks = Vec::new();
         for file in files {
+            // The log reader and its contract name a log "cursor" (the core's wire term), not the Cursor harness.
             if file.starts_with(&adapters)
                 || file == src.join("adapters.rs")
+                || file == src.join("log_reader.rs")
+                || file == src.join("daemon").join("contract_tests.rs")
                 || file.file_name().is_some_and(|name| name == "tests.rs")
                 || file
                     .strip_prefix(&src)
