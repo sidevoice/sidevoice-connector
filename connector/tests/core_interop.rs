@@ -1595,3 +1595,44 @@ fn t07_t16_detachable_pull_claim_reaches_the_next_real_ipc_owner() {
     assert_eq!(acknowledged["acknowledged"], 1, "{acknowledged}");
     assert_eq!(acknowledged["count"], 0, "{acknowledged}");
 }
+
+#[test]
+fn a_conversation_rejoins_by_itself_when_its_mcp_server_starts_again_until_it_leaves() {
+    let Some(core) = core_dir() else { return };
+    let profile = Profile::new("rejoin");
+    let _core = profile.start_core(&core, "rejoin-core");
+    let _connector = profile.start_connector();
+    profile.wait_linked("rejoin-core");
+    let thread = "rejoin-thread";
+    let start = |label: &str| {
+        let mut command = profile.connector(&["mcp"]);
+        command.env("SIDEVOICE_THREAD", thread);
+        let mut mcp = Mcp::start(command);
+        mcp.initialize(label);
+        mcp
+    };
+    let records =
+        || std::fs::read_dir(profile.data().join("rejoin")).map_or(0, |entries| entries.count());
+
+    let mut mcp = start("rejoin-first");
+    mcp.tool("voice_connect", json!({}));
+    assert_eq!(records(), 1);
+    mcp.stop();
+
+    // A new server for the same conversation joins without voice_connect.
+    let mut mcp = start("rejoin-second");
+    let status = until("the conversation rejoined by itself", 15, || {
+        let status = mcp.tool("voice_status", json!({}));
+        (status["joined"] == true).then_some(status)
+    });
+    assert_eq!(status["conversation"], thread, "{status}");
+
+    // Leaving removes the record: the next server does not rejoin.
+    mcp.tool("voice_disconnect", json!({}));
+    assert_eq!(records(), 0);
+    mcp.stop();
+    let mut mcp = start("rejoin-third");
+    let status = mcp.tool("voice_status", json!({}));
+    assert_ne!(status["joined"], true, "{status}");
+    mcp.stop();
+}

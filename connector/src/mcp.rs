@@ -149,8 +149,16 @@ impl Ipc {
         }
     }
 
+    /// Forgets a registration for good: it is no longer replayed and its conversation no longer rejoins by itself.
     async fn forget_registration(&self, client_ref: &str) {
-        self.registrations.lock().await.remove(client_ref);
+        let removed = self.registrations.lock().await.remove(client_ref);
+        if let Some(harness) = removed
+            .as_ref()
+            .and_then(|params| params.get("harness"))
+            .and_then(Value::as_str)
+        {
+            crate::rejoin::forget(&self.profile, harness, client_ref);
+        }
     }
 
     async fn ensure_registered(self: &Arc<Self>) -> Result<()> {
@@ -172,7 +180,7 @@ impl Ipc {
                 Ok(result) => result,
                 Err(error) if error.to_string().starts_with("CLOSED_BY_CLIENT:") => {
                     if let Some(client_ref) = client_ref {
-                        self.registrations.lock().await.remove(&client_ref);
+                        self.forget_registration(&client_ref).await;
                         self.joined.lock().await.remove(&client_ref);
                     }
                     continue;
@@ -226,6 +234,19 @@ impl Ipc {
                 if let Some(object) = registration.as_object_mut() {
                     object.remove("resume");
                 }
+                // A chat of a client that serves several at once outlives its façade (it is adopted by id) and its
+                // id is not stable across restarts: only the others rejoin by themselves. A replay (`resume`) has
+                // its record already.
+                if params.get("resume") != Some(&json!(true))
+                    && registration.get("detachable") != Some(&json!(true))
+                {
+                    if let (Some(harness), Some(title)) = (
+                        registration.get("harness").and_then(Value::as_str),
+                        registration.get("title").and_then(Value::as_str),
+                    ) {
+                        crate::rejoin::save(&self.profile, harness, client_ref, title);
+                    }
+                }
                 self.registrations
                     .lock()
                     .await
@@ -234,7 +255,7 @@ impl Ipc {
         }
         if method == "unregister" {
             if let Some(client_ref) = params.get("client_ref").and_then(Value::as_str) {
-                self.registrations.lock().await.remove(client_ref);
+                self.forget_registration(client_ref).await;
             }
         }
         Ok(value)
@@ -250,6 +271,9 @@ struct Facade {
     /// Whether this client serves several of its chats at once (from `initialize`): a call that names no
     /// conversation may then be any of them.
     several_chats: Arc<AtomicBool>,
+    /// Whether this server has settled if its conversation rejoins by itself (see `rejoin`): once, after it could tell
+    /// which conversation it serves.
+    rejoin_settled: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -345,7 +369,64 @@ impl Facade {
             profile,
             joined,
             several_chats: Arc::new(AtomicBool::new(false)),
+            rejoin_settled: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Joins this server's conversation again by itself when it joined before and was not closed or left since (see
+    /// `rejoin`): the register call of a replay, which the daemon refuses for a conversation the person or the agent
+    /// closed. Only the conversation this server's own call identifies; nothing is launched. `meta` is the current
+    /// call's, empty at `initialize`. Settles once the conversation was identified (or a call could not name one).
+    async fn rejoin_by_itself(
+        &self,
+        meta: &Value,
+        client: &Value,
+        client_caps: &Value,
+        call: bool,
+    ) {
+        if self.rejoin_settled.load(Ordering::Acquire) || self.several_chats() {
+            return;
+        }
+        let env = |name: &str| std::env::var(name).ok();
+        let context = CallContext {
+            env: &env,
+            meta,
+            client,
+            client_capabilities: client_caps,
+        };
+        let identified = self.registry.identify(&context).ok().flatten();
+        if identified.is_some() || call {
+            self.rejoin_settled.store(true, Ordering::Release);
+        }
+        let Some(conversation) = identified else {
+            return;
+        };
+        let title = crate::rejoin::load(&self.profile, &conversation.harness, &conversation.id);
+        let already = self.joined.lock().await.contains_key(&conversation.id);
+        let register = registration_params(&context, &conversation, "", false);
+        let Some(params) = crate::rejoin::rejoin_params(title, already, register) else {
+            return;
+        };
+        // Closed by the person, left by the agent, or blocked: the daemon refuses and the record is removed.
+        let Ok(result) = self.ipc.call("register", params.clone()).await else {
+            return;
+        };
+        let Some(binding_id) = result.get("binding_id").and_then(Value::as_str) else {
+            return;
+        };
+        self.joined.lock().await.insert(
+            conversation.id.clone(),
+            Joined {
+                binding_id: binding_id.to_owned(),
+                initial_reply_context: result
+                    .get("initial_reply_context")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                title: params["title"].as_str().unwrap_or_default().to_owned(),
+                conversation,
+                inbound: result.get("inbound").cloned().unwrap_or(Value::Null),
+            },
+        );
     }
 
     async fn refresh_binding_ids(&self, status: &Value) {
@@ -458,11 +539,7 @@ impl Facade {
                     }
                 }
                 let id = conversation.id.clone();
-                let params = json!({
-                    "client_ref":id,"harness":conversation.harness,"thread":id,"title":title,
-                    "endpoint":adapters::endpoint(&call),"detachable":several,
-                    "agent":conversation.agent.to_json()
-                });
+                let params = registration_params(&call, &conversation, &title, several);
                 let result = self.ipc.call("register", params).await?;
                 let binding_id = result
                     .get("binding_id")
@@ -1009,6 +1086,13 @@ impl ServerHandler for Facade {
         let several = Registry::hosts_several_chats(&client, &client_caps);
         self.several_chats.store(several, Ordering::Relaxed);
         context.peer.set_peer_info(request.clone());
+        let facade = self.clone();
+        let caps = client_caps.clone();
+        tokio::spawn(async move {
+            facade
+                .rejoin_by_itself(&json!({}), &client, &caps, false)
+                .await;
+        });
         self.negotiate_initialize(&request)
     }
 
@@ -1039,6 +1123,8 @@ impl ServerHandler for Facade {
             .client_capabilities()
             .and_then(|value| serde_json::to_value(value).ok())
             .unwrap_or_else(|| json!({}));
+        self.rejoin_by_itself(&meta, &client, &client_caps, true)
+            .await;
         let result = self
             .invoke(&request.name, args, meta, client, client_caps)
             .await;
@@ -1164,6 +1250,22 @@ fn client_info(raw: &Value) -> Value {
 /// A tool call's `_meta`, as the agent sent it. rmcp moves the request's `_meta` into its context before the handler
 /// runs (`context.meta`), so that is where an agent's per-call identity is (a harness may name the conversation in it
 /// on every call). What the params still carry is merged over it.
+/// What the daemon is asked to register for `conversation`: joining by voice_connect and rejoining by itself ask the
+/// same.
+fn registration_params(
+    call: &CallContext,
+    conversation: &Conversation,
+    title: &str,
+    several: bool,
+) -> Value {
+    let id = &conversation.id;
+    json!({
+        "client_ref":id,"harness":conversation.harness,"thread":id,"title":title,
+        "endpoint":adapters::endpoint(call),"detachable":several,
+        "agent":conversation.agent.to_json()
+    })
+}
+
 fn call_meta(context: &impl serde::Serialize, params: Option<impl serde::Serialize>) -> Value {
     let mut meta = serde_json::to_value(context)
         .ok()
