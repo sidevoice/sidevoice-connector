@@ -176,6 +176,20 @@ impl Ipc {
                 .map(str::to_owned);
             let mut replay = params;
             replay["resume"] = json!(true);
+            // The core binding it renews, as last known: the core refuses it when the conversation was closed while the
+            // daemon was away, instead of taking it as the agent connecting anew.
+            let known = match &client_ref {
+                Some(client_ref) => self
+                    .joined
+                    .lock()
+                    .await
+                    .get(client_ref)
+                    .map(|joined| joined.binding_id.clone()),
+                None => None,
+            };
+            if let Some(binding_id) = known.filter(|id| !id.starts_with("local-")) {
+                replay["binding_id"] = json!(binding_id);
+            }
             let result = match self.call_ready("register", replay).await {
                 Ok(result) => result,
                 Err(error) if error.to_string().starts_with("CLOSED_BY_CLIENT:") => {
@@ -236,15 +250,28 @@ impl Ipc {
                 }
                 // A chat of a client that serves several at once outlives its façade (it is adopted by id) and its
                 // id is not stable across restarts: only the others rejoin by themselves. A replay (`resume`) has
-                // its record already.
-                if params.get("resume") != Some(&json!(true))
-                    && registration.get("detachable") != Some(&json!(true))
-                {
-                    if let (Some(harness), Some(title)) = (
-                        registration.get("harness").and_then(Value::as_str),
-                        registration.get("title").and_then(Value::as_str),
-                    ) {
-                        crate::rejoin::save(&self.profile, harness, client_ref, title);
+                // its record already: only the core's binding id is kept current.
+                let binding_id = value.get("binding_id").and_then(Value::as_str);
+                if let Some(harness) = registration.get("harness").and_then(Value::as_str) {
+                    if params.get("resume") == Some(&json!(true)) {
+                        if let Some(binding_id) = binding_id {
+                            crate::rejoin::update_binding(
+                                &self.profile,
+                                harness,
+                                client_ref,
+                                binding_id,
+                            );
+                        }
+                    } else if registration.get("detachable") != Some(&json!(true)) {
+                        if let Some(title) = registration.get("title").and_then(Value::as_str) {
+                            crate::rejoin::save(
+                                &self.profile,
+                                harness,
+                                client_ref,
+                                title,
+                                binding_id,
+                            );
+                        }
                     }
                 }
                 self.registrations
@@ -274,6 +301,43 @@ struct Facade {
     /// Whether this server has settled if its conversation rejoins by itself (see `rejoin`): once, after it could tell
     /// which conversation it serves.
     rejoin_settled: Arc<AtomicBool>,
+    /// Held by a rejoin attempt and by `voice_disconnect`, so a disconnect waits for an attempt in flight and the
+    /// attempts after it see that it happened (`rejoin_cancelled`).
+    rejoin_lock: Arc<Mutex<()>>,
+    /// Set by `voice_disconnect`: this server's conversation no longer rejoins by itself.
+    rejoin_cancelled: Arc<AtomicBool>,
+}
+
+/// How a rejoin attempt ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Rejoin {
+    /// Joined, refused for good, or nothing left to do.
+    Settled,
+    /// Failed in a way that may pass (the daemon restarting, an IPC timeout, the previous server's binding not let go
+    /// yet): tried again later.
+    Retry,
+}
+
+/// The waits between rejoin attempts that failed in a way that may pass: about half a minute in all, then it gives up.
+const REJOIN_RETRIES: [Duration; 5] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(16),
+];
+
+/// What a refused rejoin means: the conversation was closed or left (its record goes), it cannot connect at all (its
+/// agent's settings hold messages back: no retry, the record stays for when they change), or anything else, which may
+/// pass.
+fn rejoin_refusal(error: &str) -> (Rejoin, bool) {
+    if error.starts_with("CLOSED_BY_CLIENT:") {
+        (Rejoin::Settled, true)
+    } else if error.starts_with("This conversation cannot connect:") {
+        (Rejoin::Settled, false)
+    } else {
+        (Rejoin::Retry, false)
+    }
 }
 
 #[derive(Clone)]
@@ -370,6 +434,8 @@ impl Facade {
             joined,
             several_chats: Arc::new(AtomicBool::new(false)),
             rejoin_settled: Arc::new(AtomicBool::new(false)),
+            rejoin_lock: Arc::new(Mutex::new(())),
+            rejoin_cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -401,19 +467,77 @@ impl Facade {
         let Some(conversation) = identified else {
             return;
         };
-        let title = crate::rejoin::load(&self.profile, &conversation.harness, &conversation.id);
-        let already = self.joined.lock().await.contains_key(&conversation.id);
         let register = registration_params(&context, &conversation, "", false);
-        let Some(params) = crate::rejoin::rejoin_params(title, already, register) else {
+        if self.try_rejoin(&conversation, &register).await == Rejoin::Settled {
             return;
+        }
+        let facade = self.clone();
+        tokio::spawn(async move {
+            for wait in REJOIN_RETRIES {
+                tokio::time::sleep(wait).await;
+                if facade.try_rejoin(&conversation, &register).await == Rejoin::Settled {
+                    return;
+                }
+            }
+            tracing::warn!(
+                stage = "rejoin",
+                result = "gave_up",
+                "the conversation could not rejoin voice by itself; voice_connect joins it"
+            );
+        });
+    }
+
+    /// One attempt at rejoining `conversation` from its record (see `rejoin_by_itself`), `register` being what joining
+    /// it asks the daemon for. Not after a `voice_disconnect`, nor when it is joined already.
+    async fn try_rejoin(&self, conversation: &Conversation, register: &Value) -> Rejoin {
+        let _attempt = self.rejoin_lock.lock().await;
+        if self.rejoin_cancelled.load(Ordering::Acquire) {
+            return Rejoin::Settled;
+        }
+        let record = crate::rejoin::load(&self.profile, &conversation.harness, &conversation.id);
+        let already = self.joined.lock().await.contains_key(&conversation.id);
+        let Some(params) = crate::rejoin::rejoin_params(record, already, register.clone()) else {
+            return Rejoin::Settled;
         };
-        // Closed by the person, left by the agent, or blocked: the daemon refuses and the record is removed.
-        let Ok(result) = self.ipc.call("register", params.clone()).await else {
-            return;
+        let result = match self.ipc.call("register", params.clone()).await {
+            Ok(result) => result,
+            Err(error) => {
+                // Closed by the person (also while nobody listened: the core refuses the resume), left by the agent, or
+                // blocked: the record goes. Anything that may pass is tried again.
+                let (outcome, forget) = rejoin_refusal(&error.to_string());
+                if forget {
+                    crate::rejoin::forget(&self.profile, &conversation.harness, &conversation.id);
+                }
+                tracing::info!(
+                    stage = "rejoin",
+                    result = if forget {
+                        "closed"
+                    } else if outcome == Rejoin::Retry {
+                        "retry"
+                    } else {
+                        "refused"
+                    },
+                    "the conversation did not rejoin voice by itself"
+                );
+                return outcome;
+            }
         };
         let Some(binding_id) = result.get("binding_id").and_then(Value::as_str) else {
-            return;
+            return Rejoin::Settled;
         };
+        let title = params["title"].as_str().unwrap_or_default().to_owned();
+        // Renewed: a session that keeps coming back is not swept as one that never did. Until the core answers, the
+        // binding it renews is the one recorded.
+        let core_binding = Some(binding_id)
+            .filter(|id| !id.starts_with("local-"))
+            .or_else(|| params["binding_id"].as_str());
+        crate::rejoin::save(
+            &self.profile,
+            &conversation.harness,
+            &conversation.id,
+            &title,
+            core_binding,
+        );
         self.joined.lock().await.insert(
             conversation.id.clone(),
             Joined {
@@ -422,11 +546,17 @@ impl Facade {
                     .get("initial_reply_context")
                     .cloned()
                     .unwrap_or(Value::Null),
-                title: params["title"].as_str().unwrap_or_default().to_owned(),
-                conversation,
+                title,
+                conversation: conversation.clone(),
                 inbound: result.get("inbound").cloned().unwrap_or(Value::Null),
             },
         );
+        tracing::info!(
+            stage = "rejoin",
+            result = "joined",
+            "the conversation rejoined voice by itself"
+        );
+        Rejoin::Settled
     }
 
     async fn refresh_binding_ids(&self, status: &Value) {
@@ -442,6 +572,14 @@ impl Facade {
                 continue;
             };
             if let Some(binding) = joined.get_mut(client_ref) {
+                if binding.binding_id != binding_id {
+                    crate::rejoin::update_binding(
+                        &self.profile,
+                        &binding.conversation.harness,
+                        client_ref,
+                        binding_id,
+                    );
+                }
                 binding.binding_id = binding_id.to_owned();
                 if let Some(context) = item.get("initial_reply_context") {
                     binding.initial_reply_context = context.clone();
@@ -933,14 +1071,40 @@ impl Facade {
                 if self.several_chats() && named.is_none() {
                     bail!("Several chats of this window may be joined; pass the conversation id voice_connect returned in this chat.");
                 }
-                let chosen = self.pick(named).await?.context("not connected")?;
-                let id = self
-                    .joined
-                    .lock()
-                    .await
-                    .get(&chosen)
-                    .map(|binding| binding.binding_id.clone())
-                    .context("not connected")?;
+                // Leaving is for good, whatever the daemon answers: a rejoin in flight is waited for, none follows, and
+                // the record goes before the daemon is asked, also when this conversation is not joined (yet).
+                let _rejoin = self.rejoin_lock.lock().await;
+                if !self.several_chats() {
+                    self.rejoin_cancelled.store(true, Ordering::Release);
+                }
+                let chosen = self.pick(named).await?;
+                let joined =
+                    match &chosen {
+                        Some(chosen) => self.joined.lock().await.get(chosen).map(|binding| {
+                            (binding.binding_id.clone(), binding.conversation.clone())
+                        }),
+                        None => None,
+                    };
+                let leaving = match &joined {
+                    Some((_, conversation)) => Some(conversation.clone()),
+                    None if !self.several_chats() => {
+                        let env = |name: &str| std::env::var(name).ok();
+                        let call = CallContext {
+                            env: &env,
+                            meta: &meta,
+                            client: &client,
+                            client_capabilities: &client_caps,
+                        };
+                        self.registry.identify(&call).ok().flatten()
+                    }
+                    None => None,
+                };
+                if let Some(conversation) = leaving {
+                    crate::rejoin::forget(&self.profile, &conversation.harness, &conversation.id);
+                }
+                let (Some(chosen), Some((id, _))) = (chosen, joined) else {
+                    bail!("not connected");
+                };
                 let result = self
                     .ipc
                     .call("unregister", json!({"binding_id":id,"client_ref":chosen}))
@@ -1089,6 +1253,11 @@ impl ServerHandler for Facade {
         let facade = self.clone();
         let caps = client_caps.clone();
         tokio::spawn(async move {
+            crate::rejoin::sweep(
+                &facade.profile,
+                std::time::SystemTime::now(),
+                crate::rejoin::MAX_AGE,
+            );
             facade
                 .rejoin_by_itself(&json!({}), &client, &caps, false)
                 .await;
@@ -1283,11 +1452,35 @@ fn call_meta(context: &impl serde::Serialize, params: Option<impl serde::Seriali
 #[cfg(test)]
 mod tests {
     use super::{
-        closed_note, diagnosis, ipc_limit, tools, Agent, Conversation, Facts, Joined, INSTRUCTIONS,
+        closed_note, diagnosis, ipc_limit, rejoin_refusal, tools, Agent, Conversation, Facts,
+        Joined, Rejoin, INSTRUCTIONS,
     };
     use rmcp::model::InitializeRequestParams;
     use serde_json::{json, Value};
     use std::time::Duration;
+
+    #[test]
+    fn a_rejoin_refused_as_closed_forgets_its_record_and_only_a_failure_that_may_pass_is_retried() {
+        assert_eq!(
+            rejoin_refusal("CLOSED_BY_CLIENT:binding_closed:s1"),
+            (Rejoin::Settled, true)
+        );
+        assert_eq!(
+            rejoin_refusal("CLOSED_BY_CLIENT:left_by_agent:s1"),
+            (Rejoin::Settled, true)
+        );
+        assert_eq!(
+            rejoin_refusal("This conversation cannot connect: held back. Allow it."),
+            (Rejoin::Settled, false)
+        );
+        for passing in [
+            "connector request timed out",
+            "connector went away",
+            "binding belongs to another façade",
+        ] {
+            assert_eq!(rejoin_refusal(passing), (Rejoin::Retry, false), "{passing}");
+        }
+    }
 
     #[test]
     fn device_code_instructions_say_when_to_call_it() {
