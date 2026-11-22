@@ -1,5 +1,7 @@
 # Releasing
 
+The release rules (nightlies during development, the release-please PR, release day, pins) are the organisation's, in the [releasing guideline](https://github.com/sidevoice/.github-private/blob/main/docs/releasing.md). This file is only this repository's own steps.
+
 One version for the connector, tagged `vX.Y.Z`. It lives in `connector/Cargo.toml` (the build tooling at
 the workspace root and `testbench/` carry the same one, and `Cargo.lock` both); release-please moves them together
 (`release-please-config.json`). Never edit it by hand. The connector is distributed as GitHub Releases of this
@@ -153,10 +155,6 @@ gh attestation verify sidevoice-connector-0.7.0-linux-x86_64.tar.zst \
 The core is inside (sidevoice/sidevoice-connector#66, decision 2): nothing is downloaded at install. Installing
 stages it from the package into the release, checked against its inventory (`connector/src/core_package.rs`).
 
-The changelog is written from the squashed PR titles. To change it, edit `CHANGELOG.md` in the release PR right
-before merging it: any later merge into `main` regenerates the PR. After the release, fix the notes on the
-Release itself.
-
 ## npm: what is published and how to add a platform
 
 ### What is published
@@ -248,27 +246,11 @@ archive checks follow from `TARGETS`. The pinned core publishes `sidevoice-core-
 Not decided, so not done: Authenticode signing and the installer format (the archive and the npm package are the
 only Windows distribution here).
 
-## Which version comes next
-
-`fix:` → patch, `feat:` → minor. While the version is 0.x a breaking change (`feat!:` or a `BREAKING CHANGE:`
-footer) bumps the minor, not the major. `docs:`, `chore:`, `ci:`, `test:`, `refactor:` alone make no release.
+## Versions
 
 The manifest starts at 0.6.0, the version the npm package carried. release-please finds the tag `v0.6.0` and reads
 the history from it; without that tag it reads from the commit where this repository became the client alone
 (`bootstrap-sha`).
-
-## A release candidate, or any explicit version
-
-Put the footer as the **last line of a PR's description** (the squash commit takes the description as its body):
-
-```
-Release-As: 0.7.0-rc.1
-```
-
-The release PR then proposes exactly that version. A version with a `-` suffix is published as a **pre-release and
-never as latest**. The next candidate is `Release-As: 0.7.0-rc.2`; the final one is `Release-As: 0.7.0` (say it:
-after a candidate, do not leave the next version to the computation). With nothing else to merge, a PR with one
-empty commit (`git commit --allow-empty`) carries the footer.
 
 ## Nightly
 
@@ -292,11 +274,6 @@ Build artifacts on Actions runs are kept 7 days, for debugging only. Download fr
 
 ## What this needs from the repository settings
 
-- Settings → Actions → General → **Allow GitHub Actions to create and approve pull requests**: without it
-  release-please cannot open its PR.
-- Squash merging, with the PR title as the commit message.
-- `ci` and **PR title is a conventional commit** run on every PR; release-please's own PR gets both through a
-  dispatched run (its pushes start no workflow by themselves). Make both required in a ruleset to enforce them.
 - The `npm` environment is not used: publishing to npm runs in no environment, and its approval is the staged
   launcher's (see [npm](#npm-what-is-published-and-how-to-add-a-platform)). Delete it.
 - On npmjs.com, a trusted publisher for each npm package ([Trusted publishing](#who-publishes-and-how)).
