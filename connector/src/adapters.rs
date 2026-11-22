@@ -232,7 +232,7 @@ fn unheard_block(unheard: Option<&Value>) -> Result<Option<String>> {
 fn reply_rule(channel: &str, kind: Option<&str>, say: &str) -> String {
     match (channel, kind) {
         ("note", Some("turn_empty" | "user_returned")) => format!(
-            "[Sidevoice] This note tells you when to speak again, not whether: the person can hear you now. If you still owe them an answer (a refused or unheard reply, or a result), give it now with {say}, with what is new and relevant at this moment, in fresh words, without saying it was missed."
+            "[Sidevoice] This note tells you when to speak again, not whether: the person can hear you now. If you still owe them an answer (an unheard reply, or a result), give it now with {say}, with what is new and relevant at this moment, in fresh words, without saying it was missed."
         ),
         ("note", _) => format!(
             "[Sidevoice] This note tells you when to speak again, not whether: what the person asked decides that. Use {say} for your next spoken reply."
