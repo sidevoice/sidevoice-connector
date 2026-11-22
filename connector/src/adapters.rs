@@ -112,7 +112,8 @@ pub fn unidentified(client: Option<&Value>) -> String {
 /// The one pointer sentence every voice and note envelope ends with. A message after it begins a new envelope
 /// (`transcript::voice_headers`). Rules live once, in the MCP instructions and tool descriptions; a message carries
 /// data only.
-const ENVELOPE_END: &str = "See the Sidevoice instructions.";
+const ENVELOPE_END: &str =
+    "See the Sidevoice instructions. Voice: self-contained, one point at a time.";
 
 /// How the person wants the agent to speak: the amount of content, never where it goes.
 pub const SPEAKING_STYLES: [&str; 3] = ["brief", "normal", "detailed"];
@@ -177,9 +178,22 @@ pub fn envelope(event: &Value) -> Result<String> {
         tag_value(session_id),
         tag_value(message_id)
     );
-    if channel != "room-control" {
+    // Only a message with person input has a style: a note has none, and a missing
+    // core field would falsely read as the default.
+    if channel == "voice" {
         tag.push_str(" style=");
         tag.push_str(speaking_style(event));
+        // Words the person said while the agent could not hear them: delivered later, with when they were said.
+        if event.get("late").and_then(Value::as_bool) == Some(true) {
+            if let Some(said_at) = event
+                .get("said_at")
+                .and_then(Value::as_str)
+                .filter(|said_at| !said_at.is_empty())
+            {
+                tag.push_str(" late=1 said_at=");
+                tag.push_str(&tag_value(said_at));
+            }
+        }
     }
     tag.push_str(&unheard_tags(event.get("unheard")));
     tag.push(']');
@@ -308,7 +322,7 @@ mod tests {
         assert_eq!(injected, envelope(&pull).unwrap());
         assert_eq!(
             injected,
-            "[sidevoice channel=voice session_id=s revision=4 epoch=2 message_id=m-typed_context style=normal]\n\nalso use the second table\n\nSee the Sidevoice instructions."
+            "[sidevoice channel=voice session_id=s revision=4 epoch=2 message_id=m-typed_context style=normal]\n\nalso use the second table\n\nSee the Sidevoice instructions. Voice: self-contained, one point at a time."
         );
         for rule in [
             "in writing",
@@ -326,7 +340,7 @@ mod tests {
             "message_id":"note:9","text":""});
         assert_eq!(
             envelope(&frame).unwrap(),
-            "[sidevoice channel=note session_id=s revision=4 epoch=2 message_id=note:9 style=normal]\n\nSee the Sidevoice instructions."
+            "[sidevoice channel=note session_id=s revision=4 epoch=2 message_id=note:9]\n\nSee the Sidevoice instructions. Voice: self-contained, one point at a time."
         );
     }
 
@@ -336,6 +350,20 @@ mod tests {
         assert!(
             injected.contains("\nUse the current context.\n\nSee the"),
             "{injected}"
+        );
+    }
+
+    #[test]
+    fn a_call_ended_note_renders_its_notice_instruction_line() {
+        let mut frame = event("call_ended", "note", "");
+        frame["notice"]["instruction"] =
+            json!("Nobody is listening now: do not speak. Tell them when they are back.");
+        let out = envelope(&frame).unwrap();
+        assert!(
+            out.contains(
+                "\nNobody is listening now: do not speak. Tell them when they are back.\n\nSee the"
+            ),
+            "{out}"
         );
     }
 
@@ -370,10 +398,40 @@ mod tests {
         for value in [json!("hands-free"), json!(3), Value::Null] {
             assert!(style(Some(value)).contains(" style=normal]"));
         }
-        // Room-control messages need no reply and carry no style.
-        let mut control = event("x", "room-control", "");
-        control["speaking_style"] = json!("brief");
-        assert!(!envelope(&control).unwrap().contains("style="));
+        // Room-control messages and notes carry no person input, so no style.
+        for channel in ["room-control", "note"] {
+            let mut other = event("x", channel, "");
+            other["speaking_style"] = json!("brief");
+            assert!(!envelope(&other).unwrap().contains("style="));
+        }
+    }
+
+    #[test]
+    fn late_words_carry_when_they_were_said_and_read_back() {
+        let mut late = event("x", "voice", "hi");
+        late["late"] = json!(true);
+        late["said_at"] = json!("2026-11-20T10:15:30.250+01:00");
+        let text = envelope(&late).unwrap();
+        assert_eq!(
+            text.lines().next().unwrap(),
+            "[sidevoice channel=voice session_id=s revision=4 epoch=2 message_id=m-x style=normal late=1 said_at=2026-11-20T10:15:30.250+01:00]"
+        );
+        let headers = super::transcript::voice_headers(&text);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0]["late"], "1");
+        assert_eq!(headers[0]["said_at"], "2026-11-20T10:15:30.250+01:00");
+        // Not late, or late without a time: no tags.
+        for frame in [
+            json!({"late": false, "said_at": "2026-11-20T10:15:30Z"}),
+            json!({"late": true}),
+        ] {
+            let mut other = event("x", "voice", "hi");
+            other
+                .as_object_mut()
+                .unwrap()
+                .extend(frame.as_object().unwrap().clone());
+            assert!(!envelope(&other).unwrap().contains("late="));
+        }
     }
 
     #[test]
