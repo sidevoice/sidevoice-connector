@@ -12,6 +12,19 @@ use sidevoice_connector::platform::fs::{Files, Fs};
 use std::time::Duration;
 use support::*;
 
+/// The pinned core refused a reply published during an open turn until sidevoice-core#270, which holds it instead.
+/// While the pin predates that, the tests of the new behaviour stop at their first such publication; they run for real
+/// at the pin bump, which also deletes this helper and its call sites.
+fn pin_predates_held_replies(published: &Value) -> bool {
+    let old = published["status"] == "rejected" && published["reason"] == "user_speaking";
+    if old {
+        eprintln!(
+            "skipped: the pinned core predates sidevoice-core#270 (held replies); remove at the pin bump"
+        );
+    }
+    old
+}
+
 fn assistant_history_id(
     profile: &Profile,
     call: &Presentation,
@@ -392,7 +405,7 @@ fn t16_fetch_claim_ack_and_redelivery_use_the_real_core() {
 }
 
 #[test]
-fn t02c_t02d_open_turn_refusal_is_terminal_and_empty_notice_is_pullable() {
+fn t02c_t02d_reply_during_an_open_turn_is_held_and_an_empty_turn_sends_no_note() {
     let Some(core) = core_dir() else { return };
     let profile = Profile::new("turns-refusal");
     let _core = profile.start_core(&core, "turns-refusal-core");
@@ -419,40 +432,24 @@ fn t02c_t02d_open_turn_refusal_is_terminal_and_empty_notice_is_pullable() {
     let args = json!({"text":"Reply during the turn","session_id":call.session,
         "revision":started["revision"],"epoch":started["epoch"],
         "event_id":"refused-event","utterance_id":"refused-utterance"});
-    let refused = mcp.tool("voice_say", args.clone());
-    assert_eq!(refused["status"], "rejected", "{refused}");
-    assert_eq!(refused["reason"], "user_speaking", "{refused}");
-    assert!(refused["instruction"]
-        .as_str()
-        .unwrap()
-        .contains("Wait for their message"));
+    let held = mcp.tool("voice_say", args.clone());
+    if pin_predates_held_replies(&held) {
+        mcp.stop();
+        return;
+    }
+    assert_eq!(held["status"], "published", "{held}");
+    assert!(held.get("reason").is_none(), "{held}");
     let outbox: serde_json::Value =
         serde_json::from_slice(&std::fs::read(profile.data().join("outbox.json")).unwrap())
             .unwrap();
-    assert_eq!(outbox, json!([]), "refusal left queued audio: {outbox}");
+    assert_eq!(outbox, json!([]), "the held reply is published: {outbox}");
     call.report_turn("finished", "open", Some(""));
-    let note = until("empty-turn note in the pull queue", 15, || {
-        let page = mcp.tool("get_messages", json!({}));
-        page["messages"].as_array().and_then(|messages| {
-            messages
-                .iter()
-                .find(|message| message["notice"]["kind"] == "turn_empty")
-                .cloned()
-        })
-    });
-    assert_eq!(note["channel"], "note", "{note}");
-    assert_eq!(note["text"], "", "{note}");
-    let envelope = note["envelope"].as_str().unwrap();
-    assert!(envelope.contains("person sent no words"), "{envelope}");
-    assert!(
-        envelope.contains(
-            "This note tells you when to speak again, not whether: the person can hear you now."
-        ),
-        "{envelope}"
-    );
-    let after = mcp.tool("voice_say", args);
-    assert_eq!(after["status"], "rejected", "{after}");
-    assert_eq!(after["reason"], "user_speaking", "{after}");
+    // The reply plays on and nothing was withdrawn: the agent is told nothing.
+    std::thread::sleep(Duration::from_secs(3));
+    let page = mcp.tool("get_messages", json!({}));
+    assert_eq!(page["messages"], json!([]), "{page}");
+    let again = mcp.tool("voice_say", args);
+    assert_eq!(again["status"], "published", "{again}");
     let history = core_json(
         &profile.core_endpoint(),
         "GET",
@@ -460,14 +457,13 @@ fn t02c_t02d_open_turn_refusal_is_terminal_and_empty_notice_is_pullable() {
         None,
         Some(&call.token),
     );
-    assert!(
-        history["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|row| row["role"] != "assistant"),
-        "refused speech created a reply bubble: {history}"
-    );
+    let replies = history["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["role"] == "assistant")
+        .count();
+    assert_eq!(replies, 1, "one reply bubble, not duplicated: {history}");
     mcp.stop();
 }
 
@@ -1068,7 +1064,7 @@ fn t06d_real_return_notice_is_delivered_once_in_push_and_pull() {
 }
 
 #[test]
-fn t02c_t02d_refusal_reaches_the_caller_and_words_or_empty_input_in_both_modes() {
+fn t02c_t02d_held_reply_meets_words_or_empty_input_in_both_modes() {
     let Some(core) = core_dir() else { return };
     for mode in ["push", "pull"] {
         for (suffix, words) in [("words", Some("Person's words")), ("empty", None)] {
@@ -1101,48 +1097,50 @@ fn t02c_t02d_refusal_reaches_the_caller_and_words_or_empty_input_in_both_modes()
             );
             call.report_turn("started", "open", None);
             let started = call.turn_started("open");
-            let refused = mcp.tool(
+            let held = mcp.tool(
                 "voice_say",
                 json!({"text":"During open turn",
                 "session_id":call.session,"revision":started["revision"],"epoch":started["epoch"],
-                "event_id":"refused-event","utterance_id":"refused-utterance"}),
+                "event_id":"held-event","utterance_id":"held-utterance"}),
             );
-            assert_eq!(refused["status"], "rejected", "{refused}");
-            assert_eq!(refused["reason"], "user_speaking", "{refused}");
-            assert!(refused["instruction"].as_str().unwrap().contains("Wait"));
+            if pin_predates_held_replies(&held) {
+                mcp.stop();
+                continue;
+            }
+            assert_eq!(held["status"], "published", "{held}");
             call.report_turn("finished", "open", words);
-            let message = if mode == "push" {
-                receiver
-                    .bodies
-                    .recv_timeout(Duration::from_secs(15))
-                    .unwrap()
-            } else {
-                until("refusal outcome pulled", 15, || {
-                    let page = mcp.tool("get_messages", json!({}));
-                    page["messages"]
-                        .as_array()
-                        .and_then(|items| items.first().cloned())
-                })
-            };
             if let Some(words) = words {
+                let message = if mode == "push" {
+                    receiver
+                        .bodies
+                        .recv_timeout(Duration::from_secs(15))
+                        .unwrap()
+                } else {
+                    until("the person's words pulled", 15, || {
+                        let page = mcp.tool("get_messages", json!({}));
+                        page["messages"]
+                            .as_array()
+                            .and_then(|items| items.first().cloned())
+                    })
+                };
                 assert_eq!(message["text"], words, "{message}");
                 assert_eq!(message["channel"], "voice", "{message}");
+                assert_eq!(
+                    message["unheard"]["count"], 1,
+                    "the held reply was withdrawn by the words: {message}"
+                );
+            } else if mode == "push" {
                 assert!(
-                    message["envelope"]
-                        .as_str()
-                        .unwrap()
-                        .contains("Only its content decides whether to answer by voice"),
-                    "{message}"
+                    receiver
+                        .bodies
+                        .recv_timeout(Duration::from_secs(3))
+                        .is_err(),
+                    "a held reply that plays on sends the agent nothing"
                 );
             } else {
-                assert_eq!(message["text"], "", "{message}");
-                assert_eq!(message["notice"]["kind"], "turn_empty", "{message}");
-                let envelope = message["envelope"].as_str().unwrap();
-                assert!(envelope.contains("Resend what you meant"), "{envelope}");
-                assert!(
-                    envelope.contains("give it now with voice_say (session_id"),
-                    "{envelope}"
-                );
+                std::thread::sleep(Duration::from_secs(3));
+                let page = mcp.tool("get_messages", json!({}));
+                assert_eq!(page["messages"], json!([]), "{page}");
             }
             let history = core_json(
                 &profile.core_endpoint(),
@@ -1151,14 +1149,13 @@ fn t02c_t02d_refusal_reaches_the_caller_and_words_or_empty_input_in_both_modes()
                 None,
                 Some(&call.token),
             );
-            assert!(
-                history["messages"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .all(|row| row["role"] != "assistant"),
-                "{history}"
-            );
+            let replies = history["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| row["role"] == "assistant")
+                .count();
+            assert_eq!(replies, 1, "{history}");
             mcp.stop();
         }
     }
@@ -1438,7 +1435,7 @@ fn t16_failed_injection_and_pull_expose_identical_real_notice_fields() {
 }
 
 #[test]
-fn t02c_t02d_backlogged_other_conversation_cannot_hide_real_core_refusal() {
+fn t02c_t02d_backlogged_other_conversation_does_not_disturb_a_held_reply() {
     let Some(core) = core_dir() else { return };
     for (suffix, words) in [("words", Some("New request")), ("empty", None)] {
         let label = format!("backlog-{suffix}");
@@ -1467,26 +1464,30 @@ fn t02c_t02d_backlogged_other_conversation_cannot_hide_real_core_refusal() {
         );
         call.report_turn("started", "open", None);
         let started = call.turn_started("open");
-        let refused = mcp.tool(
+        let held = mcp.tool(
             "voice_say",
-            json!({"text":"Refuse now",
+            json!({"text":"Held now",
             "session_id":call.session,"revision":started["revision"],"epoch":started["epoch"],
             "event_id":"new-event","utterance_id":"new-utterance"}),
         );
-        assert_eq!(refused["status"], "rejected", "{refused}");
-        assert_eq!(refused["reason"], "user_speaking", "{refused}");
-        assert!(refused["instruction"].as_str().unwrap().contains("Wait"));
+        if pin_predates_held_replies(&held) {
+            mcp.stop();
+            continue;
+        }
+        assert_eq!(held["status"], "published", "{held}");
         call.report_turn("finished", "open", words);
-        let message = until("backlogged refusal outcome", 15, || {
-            let page = mcp.tool("get_messages", json!({}));
-            page["messages"]
-                .as_array()
-                .and_then(|items| items.first().cloned())
-        });
         if let Some(words) = words {
+            let message = until("backlogged words outcome", 15, || {
+                let page = mcp.tool("get_messages", json!({}));
+                page["messages"]
+                    .as_array()
+                    .and_then(|items| items.first().cloned())
+            });
             assert_eq!(message["text"], words, "{message}");
         } else {
-            assert_eq!(message["notice"]["kind"], "turn_empty", "{message}");
+            std::thread::sleep(Duration::from_secs(3));
+            let page = mcp.tool("get_messages", json!({}));
+            assert_eq!(page["messages"], json!([]), "{page}");
         }
         let retained: Value =
             serde_json::from_slice(&std::fs::read(&outbox_path).unwrap()).unwrap();

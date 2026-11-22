@@ -210,7 +210,7 @@
       "before": {"notice": {"kind": "turn_empty"}, "unheard": {"count": 1}},
       "after": {"notice": {"kind": "turn_empty"}},
       "same_message_id": true,
-      "meaning": "Remove satisfied reply evidence but keep the no-words obligation"
+      "meaning": "Remove satisfied reply evidence but keep the turn_empty note: a reply the turn held was withdrawn (past the hold time, or by another call), and the agent still learns the turn ended with no words"
     },
     "ordinary_miss_after_full_receipt": {"delivered": false}
   },
