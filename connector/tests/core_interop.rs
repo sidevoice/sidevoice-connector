@@ -17,12 +17,32 @@ use support::*;
 /// at the pin bump, which also deletes this helper and its call sites.
 fn pin_predates_held_replies(published: &Value) -> bool {
     let old = published["status"] == "rejected" && published["reason"] == "user_speaking";
+    // The release that carries sidevoice-core#270 is the next core minor after the pin at the time of writing (v0.19.0):
+    // v0.20.0. From that pin on the skip must not survive: fail loudly so the bump deletes this helper.
+    let pinned = pinned_core_version();
+    assert!(
+        pinned < semver::Version::new(0, 20, 0),
+        "the core pin is v{pinned}, which includes sidevoice-core#270 (v0.20.0): delete pin_predates_held_replies and its call sites"
+    );
     if old {
         eprintln!(
             "skipped: the pinned core predates sidevoice-core#270 (held replies); remove at the pin bump"
         );
     }
     old
+}
+
+/// The core release in the workspace `sidevoice-platform` tag.
+fn pinned_core_version() -> semver::Version {
+    let manifest: toml::Table =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../Cargo.toml"))
+            .expect("workspace manifest")
+            .parse()
+            .expect("workspace manifest is toml");
+    let tag = manifest["workspace"]["dependencies"]["sidevoice-platform"]["tag"]
+        .as_str()
+        .expect("sidevoice-platform is pinned by tag");
+    semver::Version::parse(tag.trim_start_matches('v')).expect("the core tag is a version")
 }
 
 fn assistant_history_id(
