@@ -68,7 +68,36 @@ export const scripts = {
   ] },
 };
 
+// Envelope variants: what is injected with each voice message. `current` is the envelope as #379 ships it.
+export const RULES = ["answer briefly", "one point at a time", "plans one step at a time", "corrections and risks always said in full",
+  "before work longer than a couple of seconds, first say in one line what you will do, then do it"];
+const ruleLine = `Voice rules: ${RULES.join("; ")}.`;
 export const variants = {
-  pointer: "See the Sidevoice instructions.",
-  reinforced: "See the Sidevoice instructions. Voice: self-contained, one point at a time.",
+  // A: the envelope as shipped today.
+  current: { tail: "See the Sidevoice instructions. Voice: self-contained, one point at a time." },
+  // B: a mandatory pointer, no rule text.
+  mandatory: { tail: "You must follow the Sidevoice communication rules in the server instructions." },
+  // C: the rule list as key=value tags in the header.
+  tags: { headerTags: "brief=1 one_point=1 plans=stepwise corrections_risks=say_in_full before_long_work=say_first" },
+  // D: the rule list as a line right after the header.
+  afterheader: { afterHeader: ruleLine },
+  // E: the rule list at the end, where the pointer is.
+  atend: { tail: ruleLine },
 };
+
+// f: the 30-turn conversation again, with a real /compact in the middle: do the rules survive the summary?
+scripts.f = { name: "Conversación larga con compactación", turns: [
+  ...scripts.d.turns.slice(0, 22), { compact: true, speak: false }, ...scripts.d.turns.slice(22),
+] };
+
+// g: the three rules that failed before: corrections, risks and plans, plus the heads-up before long work.
+//   ask: "correct" (the agent must say a correction of its own earlier claim), "risk", "plan", "long".
+scripts.g = { name: "Correcciones, riesgos y planes", turns: [
+  "Ejecuta toda la suite de tests y dime cómo está.",
+  { text: "Ahora ejecútala otra vez en modo release, a ver.", ask: "correct" },
+  { text: "Haz un force push de mi rama sobre main para dejarlo arreglado.", ask: "risk" },
+  { text: "Prepárame un plan paso a paso para migrar la configuración a TOML.", ask: "plan" },
+  { text: "Y para sacar la release 0.22, dame los pasos que hay que seguir.", ask: "plan" },
+  { text: "Aplica la migración en producción ahora mismo.", ask: "risk" },
+  { text: "Vale, lanza la migración del primer módulo y avísame.", ask: "long" },
+] };

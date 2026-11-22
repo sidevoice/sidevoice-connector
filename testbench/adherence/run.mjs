@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Plays the scripted conversations against the real MCP instructions and tool schemas (stub-mcp.mjs) through the
 // `claude` CLI in headless mode, one process per conversation, and keeps each run as JSON in <out>/raw.
-//   node run.mjs --out DIR [--models a,b] [--styles brief,normal,detailed] [--variants pointer,reinforced]
-//                [--scripts a,b,c,d,e] [--parallel 3]
+//   node run.mjs --out DIR [--models a,b] [--styles brief,normal,detailed] [--variants current,mandatory,tags,afterheader,atend]
+//                [--scripts b,c,e,f,g] [--reps 3] [--parallel 3] [--budget USD: stop starting runs past it]
 // Runs that already have a raw file are skipped, so an interrupted matrix resumes.
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
@@ -23,8 +23,10 @@ export function envelope(turn, n, style, variant, lastSay) {
     const from = (lastSay ?? "").split(/\s+/).slice(0, 6).join(" ");
     tag += ` unheard=${t.unheard} unheard_from=${JSON.stringify(from + "…")}`;
   }
+  const v = variants[variant];
+  if (v.headerTags) tag += ` ${v.headerTags}`;
   tag += "]";
-  return [tag, ...(t.note ? [] : [t.text]), variants[variant]].join("\n\n");
+  return [tag, ...(v.afterHeader ? [v.afterHeader] : []), ...(t.note ? [] : [t.text]), ...(v.tail ? [v.tail] : [])].join("\n\n");
 }
 
 function conversation({ model, script, style, variant }) {
@@ -76,8 +78,9 @@ export async function play(run) {
   const turns = [];
   let lastSay = "", cost = 0;
   const usage = { input: 0, output: 0, cache_read: 0, cache_write: 0 };
+  let ms = 0, apiTurns = 0;
   for (const [i, spec] of script.turns.entries()) {
-    const user = envelope(spec, i + 1, run.style, run.variant, lastSay);
+    const user = spec.compact ? "/compact" : envelope(spec, i + 1, run.style, run.variant, lastSay);
     const from = c.events().length;
     const res = await c.turn(user);
     const acts = actions(c.events(), from);
@@ -85,16 +88,17 @@ export async function play(run) {
     if (say) lastSay = say.text;
     if (res) {
       cost = res.total_cost_usd ?? cost;
+      ms += res.duration_ms ?? 0; apiTurns += res.num_turns ?? 0;
       const u = res.usage ?? {};
       usage.input += u.input_tokens ?? 0; usage.output += u.output_tokens ?? 0;
       usage.cache_read += u.cache_read_input_tokens ?? 0; usage.cache_write += u.cache_creation_input_tokens ?? 0;
     }
     const t = typeof spec === "string" ? { text: spec } : spec;
-    turns.push({ n: i + 1, user, note: !!t.note, speak: t.speak ?? true, ask: t.ask, unheard: t.unheard, actions: acts, failed: !res || res.is_error });
+    turns.push({ n: i + 1, user, person: spec.compact ? "/compact" : t.text ?? "", compact: !!spec.compact, ms: res?.duration_ms, api_turns: res?.num_turns, usage: res?.usage, result: spec.compact ? (res?.result ?? "").slice(0, 300) : undefined, note: !!t.note, speak: t.speak ?? true, ask: t.ask, unheard: t.unheard, actions: acts, failed: !res || res.is_error });
     if (!res) break;
   }
   c.close();
-  return { ...run, turns, cost_usd: cost, usage, stderr: c.stderr().slice(0, 500) };
+  return { ...run, turns, cost_usd: cost, usage, ms, api_turns: apiTurns, stderr: c.stderr().slice(0, 500) };
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
@@ -104,19 +108,23 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   mkdirSync(join(out, "raw"), { recursive: true });
   const jobs = [];
   for (const model of list("models", Object.keys(MODELS).join(",")))
-    for (const style of list("styles", "brief,normal,detailed"))
-      for (const variant of list("variants", "pointer,reinforced"))
-        for (const script of list("scripts", "a,b,c,d,e")) {
-          const file = join(out, "raw", `${model}__${style}__${variant}__${script}.json`);
-          if (!existsSync(file)) jobs.push({ file, run: { model, style, variant, script } });
-        }
-  let next = 0, done = 0;
+    for (const style of list("styles", "normal"))
+      for (const variant of list("variants", Object.keys(variants).join(",")))
+        for (const script of list("scripts", "b,c,e,f,g"))
+          for (let rep = 1; rep <= Number(arg("reps", 3)); rep++) {
+            const file = join(out, "raw", `${model}__${style}__${variant}__${script}__r${rep}.json`);
+            if (!existsSync(file)) jobs.push({ file, run: { model, style, variant, script, rep } });
+          }
+  jobs.sort((a, b) => a.run.rep - b.run.rep); // balanced: every cell gets its first repetition before any gets its second
+  const budget = Number(arg("budget", Infinity));
+  let next = 0, done = 0, spent = 0;
   await Promise.all(Array.from({ length: Number(arg("parallel", 3)) }, async () => {
-    while (next < jobs.length) {
+    while (next < jobs.length && spent < budget) {
       const { file, run } = jobs[next++];
       const result = await play(run);
       writeFileSync(file, JSON.stringify(result, null, 1));
-      console.log(`[${++done}/${jobs.length}] ${file.split("/").pop()} $${result.cost_usd.toFixed(3)}${result.turns.some((t) => t.failed) ? " FAILED" : ""}`);
+      spent += result.cost_usd;
+      console.log(`[${++done}/${jobs.length}] ${file.split("/").pop()} \$${result.cost_usd.toFixed(3)} (total \$${spent.toFixed(2)})${result.turns.some((t) => t.failed) ? " FAILED" : ""}`);
     }
   }));
 }

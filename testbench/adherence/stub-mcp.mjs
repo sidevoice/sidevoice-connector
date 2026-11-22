@@ -38,6 +38,7 @@ const canned = {
 };
 // A fake repository, enough for the model to carry on: it answers by what the command looks like.
 function shellOutput(command = "") {
+  if (/release/.test(command)) return "test result: FAILED. 211 passed; 2 failed; finished in 58.9s\nfailures: auth::token_refresh, config::reload";
   if (/test|cargo/.test(command)) return "test result: ok. 213 passed; 0 failed; finished in 41.2s";
   if (/ls|find|tree/.test(command)) return "Cargo.toml\nconnector/src/auth.rs\nconnector/src/config.rs\nconnector/tests/auth.rs";
   if (/cat|sed|grep|rg/.test(command)) return "// (file contents elided in the test)";
