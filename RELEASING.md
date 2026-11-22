@@ -252,6 +252,8 @@ The manifest starts at 0.6.0, the version the npm package carried. release-pleas
 the history from it; without that tag it reads from the commit where this repository became the client alone
 (`bootstrap-sha`).
 
+The core is bundled: a PR that moves the `sidevoice-platform` tag is a change of the connector and is titled `fix(deps): ...` (guideline, section 1), not `chore`.
+
 ## Nightly
 
 Every green `release` run on `main` moves the tag `nightly` to that commit and replaces every asset of the one
@@ -274,6 +276,7 @@ Build artifacts on Actions runs are kept 7 days, for debugging only. Download fr
 
 ## What this needs from the repository settings
 
+- The settings every repository needs (squash merging, "Allow GitHub Actions to create and approve pull requests", `ci` and the PR title check as required checks in a ruleset) are in the guideline, section 7.
 - The `npm` environment is not used: publishing to npm runs in no environment, and its approval is the staged
   launcher's (see [npm](#npm-what-is-published-and-how-to-add-a-platform)). Delete it.
 - On npmjs.com, a trusted publisher for each npm package ([Trusted publishing](#who-publishes-and-how)).
