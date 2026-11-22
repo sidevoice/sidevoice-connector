@@ -112,7 +112,8 @@ pub fn unidentified(client: Option<&Value>) -> String {
 /// The one pointer sentence every voice and note envelope ends with. A message after it begins a new envelope
 /// (`transcript::voice_headers`). Rules live once, in the MCP instructions and tool descriptions; a message carries
 /// data only.
-const ENVELOPE_END: &str = "See the Sidevoice instructions.";
+const ENVELOPE_END: &str =
+    "See the Sidevoice instructions. Voice: self-contained, one point at a time.";
 
 /// How the person wants the agent to speak: the amount of content, never where it goes.
 pub const SPEAKING_STYLES: [&str; 3] = ["brief", "normal", "detailed"];
@@ -321,7 +322,7 @@ mod tests {
         assert_eq!(injected, envelope(&pull).unwrap());
         assert_eq!(
             injected,
-            "[sidevoice channel=voice session_id=s revision=4 epoch=2 message_id=m-typed_context style=normal]\n\nalso use the second table\n\nSee the Sidevoice instructions."
+            "[sidevoice channel=voice session_id=s revision=4 epoch=2 message_id=m-typed_context style=normal]\n\nalso use the second table\n\nSee the Sidevoice instructions. Voice: self-contained, one point at a time."
         );
         for rule in [
             "in writing",
@@ -339,7 +340,7 @@ mod tests {
             "message_id":"note:9","text":""});
         assert_eq!(
             envelope(&frame).unwrap(),
-            "[sidevoice channel=note session_id=s revision=4 epoch=2 message_id=note:9]\n\nSee the Sidevoice instructions."
+            "[sidevoice channel=note session_id=s revision=4 epoch=2 message_id=note:9]\n\nSee the Sidevoice instructions. Voice: self-contained, one point at a time."
         );
     }
 

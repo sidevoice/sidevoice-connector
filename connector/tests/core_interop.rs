@@ -1137,7 +1137,7 @@ fn t02c_t02d_refusal_reaches_the_caller_and_words_or_empty_input_in_both_modes()
                     message["envelope"]
                         .as_str()
                         .unwrap()
-                        .contains("See the Sidevoice instructions."),
+                        .contains("See the Sidevoice instructions. Voice: self-contained, one point at a time."),
                     "{message}"
                 );
             } else {
