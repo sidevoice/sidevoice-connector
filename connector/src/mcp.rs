@@ -151,7 +151,21 @@ impl Ipc {
 
     /// Forgets a registration for good: it is no longer replayed and its conversation no longer rejoins by itself.
     async fn forget_registration(&self, client_ref: &str) {
+        self.drop_registration(client_ref, true).await;
+    }
+
+    /// Drops a registration that was refused as closed: its record goes only when the conversation really closed
+    /// (`reason`), and stays when the daemon merely holds resumes back (history limit, state write failure).
+    async fn drop_refused_registration(&self, client_ref: &str, reason: &str) {
+        self.drop_registration(client_ref, crate::rejoin::closed_for_good(reason))
+            .await;
+    }
+
+    async fn drop_registration(&self, client_ref: &str, forget_record: bool) {
         let removed = self.registrations.lock().await.remove(client_ref);
+        if !forget_record {
+            return;
+        }
         if let Some(harness) = removed
             .as_ref()
             .and_then(|params| params.get("harness"))
@@ -194,7 +208,12 @@ impl Ipc {
                 Ok(result) => result,
                 Err(error) if error.to_string().starts_with("CLOSED_BY_CLIENT:") => {
                     if let Some(client_ref) = client_ref {
-                        self.forget_registration(&client_ref).await;
+                        let message = error.to_string();
+                        let reason = message
+                            .strip_prefix("CLOSED_BY_CLIENT:")
+                            .and_then(|rest| rest.split(':').next())
+                            .unwrap_or_default();
+                        self.drop_refused_registration(&client_ref, reason).await;
                         self.joined.lock().await.remove(&client_ref);
                     }
                     continue;
@@ -259,6 +278,12 @@ impl Ipc {
                                 &self.profile,
                                 harness,
                                 client_ref,
+                                registration
+                                    .get("title")
+                                    .and_then(Value::as_str)
+                                    .filter(|_| {
+                                        registration.get("detachable") != Some(&json!(true))
+                                    }),
                                 binding_id,
                             );
                         }
@@ -331,8 +356,10 @@ const REJOIN_RETRIES: [Duration; 5] = [
 /// agent's settings hold messages back: no retry, the record stays for when they change), or anything else, which may
 /// pass.
 fn rejoin_refusal(error: &str) -> (Rejoin, bool) {
-    if error.starts_with("CLOSED_BY_CLIENT:") {
-        (Rejoin::Settled, true)
+    if let Some(rest) = error.strip_prefix("CLOSED_BY_CLIENT:") {
+        // Held back by the daemon (nobody closed it): the record stays for when it is lifted.
+        let reason = rest.split(':').next().unwrap_or_default();
+        (Rejoin::Settled, crate::rejoin::closed_for_good(reason))
     } else if error.starts_with("This conversation cannot connect:") {
         (Rejoin::Settled, false)
     } else {
@@ -560,6 +587,7 @@ impl Facade {
     }
 
     async fn refresh_binding_ids(&self, status: &Value) {
+        let detachable = self.several_chats();
         let Some(bindings) = status.pointer("/bindings").and_then(Value::as_array) else {
             return;
         };
@@ -572,14 +600,15 @@ impl Facade {
                 continue;
             };
             if let Some(binding) = joined.get_mut(client_ref) {
-                if binding.binding_id != binding_id {
-                    crate::rejoin::update_binding(
-                        &self.profile,
-                        &binding.conversation.harness,
-                        client_ref,
-                        binding_id,
-                    );
-                }
+                // The binding is alive: its record is renewed (or recreated, if lost), so a conversation joined for
+                // longer than the record's age is not swept as one that never came back.
+                crate::rejoin::update_binding(
+                    &self.profile,
+                    &binding.conversation.harness,
+                    client_ref,
+                    (!detachable).then_some(binding.title.as_str()),
+                    binding_id,
+                );
                 binding.binding_id = binding_id.to_owned();
                 if let Some(context) = item.get("initial_reply_context") {
                     binding.initial_reply_context = context.clone();
@@ -1031,7 +1060,7 @@ impl Facade {
                             let mut parts = rest.splitn(2, ':');
                             let reason = parts.next().unwrap_or("closed_from_client");
                             if let Some(name) = parts.next() {
-                                self.ipc.forget_registration(name).await;
+                                self.ipc.drop_refused_registration(name, reason).await;
                                 self.joined.lock().await.remove(name);
                             }
                             bail!("{}", closed_note(reason));
@@ -1469,6 +1498,12 @@ mod tests {
             rejoin_refusal("CLOSED_BY_CLIENT:left_by_agent:s1"),
             (Rejoin::Settled, true)
         );
+        for held in [
+            "CLOSED_BY_CLIENT:conversation_history_limit:s1",
+            "CLOSED_BY_CLIENT:state_write_failed:s1",
+        ] {
+            assert_eq!(rejoin_refusal(held), (Rejoin::Settled, false), "{held}");
+        }
         assert_eq!(
             rejoin_refusal("This conversation cannot connect: held back. Allow it."),
             (Rejoin::Settled, false)

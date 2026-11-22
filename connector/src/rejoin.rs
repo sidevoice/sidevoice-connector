@@ -22,6 +22,7 @@ const DIR: &str = "rejoin";
 const RECORD_LIMIT: u64 = 4096;
 /// A record not renewed for this long is removed: the core closes a conversation no device has shown for 30 days.
 pub const MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const TOUCH_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
@@ -71,18 +72,56 @@ fn write(profile: &Profile, record: &Record) {
     }
 }
 
-/// Keeps the core's binding id of a recorded conversation current (the core gives a new one after it restarts). A
-/// conversation with no record (it left, or it is not one that rejoins) stays without one.
-pub fn update_binding(profile: &Profile, harness: &str, id: &str, binding_id: &str) {
+/// Renews the record of a conversation whose binding is confirmed alive: keeps the core's binding id current (the
+/// core gives a new one after it restarts) and refreshes its age, so a conversation joined for longer than [`MAX_AGE`]
+/// is not swept as one that never came back. With a `title` a lost record is recreated; without one (the conversation
+/// is not one that rejoins, or it left) a missing record stays missing.
+pub fn update_binding(
+    profile: &Profile,
+    harness: &str,
+    id: &str,
+    title: Option<&str>,
+    binding_id: &str,
+) {
     let Some(binding_id) = core_binding(Some(binding_id)) else {
         return;
     };
-    if let Some(mut record) = load(profile, harness, id) {
-        if record.binding_id.as_deref() != Some(binding_id.as_str()) {
+    match load(profile, harness, id) {
+        Some(mut record) if record.binding_id.as_deref() != Some(binding_id.as_str()) => {
             record.binding_id = Some(binding_id);
             write(profile, &record);
         }
+        Some(_) => touch(profile, harness, id),
+        None => {
+            if let Some(title) = title {
+                save(profile, harness, id, title, Some(&binding_id));
+            }
+        }
     }
+}
+
+/// Marks the record as renewed now, at most once a day: status refreshes are frequent and the age is counted in days.
+fn touch(profile: &Profile, harness: &str, id: &str) {
+    let path = path(profile, harness, id);
+    let Ok(file) = std::fs::File::options().write(true).open(&path) else {
+        return;
+    };
+    let fresh = file
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age < TOUCH_EVERY);
+    if !fresh {
+        let _ = file.set_modified(SystemTime::now());
+    }
+}
+
+/// Whether a refused resume (`CLOSED_BY_CLIENT:<reason>:…`) means the conversation really closed or left, so its
+/// record goes. The daemon holding every resume back (history limit, state write failure) closes nobody: the record
+/// stays for when it is lifted.
+pub fn closed_for_good(reason: &str) -> bool {
+    !matches!(reason, "conversation_history_limit" | "state_write_failed")
 }
 
 /// Forgets the conversation: it will not rejoin by itself.
@@ -183,21 +222,64 @@ mod tests {
         let profile = profile(home.path());
         save(&profile, "h", "s1", "chat", Some("local-123"));
         assert_eq!(load(&profile, "h", "s1").unwrap().binding_id, None);
-        update_binding(&profile, "h", "s1", "local-456");
+        update_binding(&profile, "h", "s1", None, "local-456");
         assert_eq!(load(&profile, "h", "s1").unwrap().binding_id, None);
-        update_binding(&profile, "h", "s1", "b-1");
+        update_binding(&profile, "h", "s1", None, "b-1");
         assert_eq!(
             load(&profile, "h", "s1").unwrap().binding_id.as_deref(),
             Some("b-1")
         );
-        update_binding(&profile, "h", "s1", "b-2");
+        update_binding(&profile, "h", "s1", None, "b-2");
         assert_eq!(
             load(&profile, "h", "s1").unwrap().binding_id.as_deref(),
             Some("b-2")
         );
         // A conversation without a record (left, or one that does not rejoin) does not get one.
-        update_binding(&profile, "h", "s2", "b-3");
+        update_binding(&profile, "h", "s2", None, "b-3");
         assert_eq!(load(&profile, "h", "s2"), None);
+    }
+
+    #[test]
+    fn a_record_of_a_binding_confirmed_alive_is_renewed_and_a_lost_one_recreated_for_a_joined_conversation(
+    ) {
+        let home = crate::test_support::temp_dir("rejoin");
+        let profile = profile(home.path());
+        save(&profile, "h", "s1", "chat", Some("b-1"));
+        let age = |id: &str| {
+            std::fs::metadata(path(&profile, "h", id))
+                .unwrap()
+                .modified()
+                .unwrap()
+        };
+        let stale = SystemTime::now() - MAX_AGE - Duration::from_secs(60);
+        let set_age = |id: &str, time: SystemTime| {
+            let file = std::fs::File::options()
+                .write(true)
+                .open(path(&profile, "h", id))
+                .unwrap();
+            file.set_modified(time).unwrap();
+        };
+        set_age("s1", stale);
+        update_binding(&profile, "h", "s1", Some("chat"), "b-1");
+        assert!(age("s1") > stale + MAX_AGE);
+        sweep(&profile, SystemTime::now(), MAX_AGE);
+        assert!(load(&profile, "h", "s1").is_some());
+        // Lost record of a joined conversation: recreated from its title.
+        forget(&profile, "h", "s1");
+        update_binding(&profile, "h", "s1", Some("chat"), "b-2");
+        let record = load(&profile, "h", "s1").unwrap();
+        assert_eq!(record.title, "chat");
+        assert_eq!(record.binding_id.as_deref(), Some("b-2"));
+    }
+
+    #[test]
+    fn only_a_real_close_forgets_the_record_not_a_resume_the_daemon_holds_back() {
+        for closed in ["binding_closed", "left_by_agent", "closed_from_client"] {
+            assert!(closed_for_good(closed), "{closed}");
+        }
+        for held in ["conversation_history_limit", "state_write_failed"] {
+            assert!(!closed_for_good(held), "{held}");
+        }
     }
 
     #[test]

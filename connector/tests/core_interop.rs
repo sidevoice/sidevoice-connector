@@ -1781,3 +1781,64 @@ fn a_rejoin_keeps_a_conversation_removed_from_a_device() {
     assert!(!shows(&removing), "the removing device shows it again");
     mcp.stop();
 }
+
+/// The pod restarts: the core comes back without what it knew (no binding of the old id, no conversation) and so does
+/// the connector. The agent's MCP server starts again: the core does not know the recorded binding, so the rejoin is
+/// the conversation joining anew, and its record carries the new binding id.
+#[test]
+fn a_conversation_rejoins_after_the_core_lost_its_state_and_records_the_new_binding() {
+    let Some(core) = core_dir() else { return };
+    let profile = Profile::new("rejoinlost");
+    let mut core_process = profile.start_core(&core, "rejoin-lost-core-1");
+    let mut connector = profile.start_connector();
+    profile.wait_linked("rejoin-lost-core-1");
+    let thread = "rejoin-lost-thread";
+    let start = |label: &str| {
+        let mut command = profile.connector(&["mcp"]);
+        command.env("SIDEVOICE_THREAD", thread);
+        let mut mcp = Mcp::start(command);
+        mcp.initialize(label);
+        mcp
+    };
+    let recorded = || {
+        let dir = profile.data().join("rejoin");
+        let entry = std::fs::read_dir(dir).ok()?.flatten().next()?;
+        read_json(&entry.path())
+    };
+
+    let mut mcp = start("rejoin-lost-first");
+    mcp.tool("voice_connect", json!({"title":"Across a restart"}));
+    let old = recorded().expect("the join left a record")["binding_id"]
+        .as_str()
+        .expect("a core binding id")
+        .to_owned();
+    mcp.stop();
+    connector.stop();
+    core_process.stop();
+
+    // The core's disk is gone (a new pod): everything it kept is removed, the connector's own state stays.
+    for entry in std::fs::read_dir(profile.core_data()).unwrap().flatten() {
+        let path = entry.path();
+        let _ = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+    }
+    let _core_process = profile.start_core(&core, "rejoin-lost-core-2");
+    let _connector = profile.start_connector();
+    profile.wait_linked("rejoin-lost-core-2");
+
+    let mut mcp = start("rejoin-lost-second");
+    let status = until("the conversation rejoined by itself", 30, || {
+        let status = mcp.tool("voice_status", json!({}));
+        (status["joined"] == true).then_some(status)
+    });
+    assert_eq!(status["conversation"], thread, "{status}");
+    let new = until("the record carries the new binding id", 30, || {
+        let id = recorded()?["binding_id"].as_str()?.to_owned();
+        (id != old).then_some(id)
+    });
+    assert!(!new.starts_with("local-"), "{new}");
+    mcp.stop();
+}
