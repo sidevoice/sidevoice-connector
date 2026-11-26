@@ -49,6 +49,7 @@ fn panic<'a>(literal: Option<&'a str>, line: u32) -> Panic<'a> {
     Panic {
         version: "1.2.3",
         os: "linux",
+        os_name: "Linux",
         arch: "amd64",
         at: Utc::now(),
         literal,
@@ -139,6 +140,7 @@ fn a_record_holds_the_closed_field_list_and_a_literal_message() {
             "location",
             "log_tail",
             "os",
+            "os_name",
             "signature",
             "version"
         ]
@@ -258,6 +260,8 @@ fn a_record_with_a_bad_field_is_not_taken() {
         ("id", json!("../../x")),
         ("version", json!("1 2")),
         ("os", json!("")),
+        ("os_name", json!("Plan9")),
+        ("os_name", Value::Null),
         ("last_at", json!("yesterday")),
     ] {
         let mut bad = base.clone();
@@ -885,6 +889,7 @@ fn the_event_carries_the_closed_field_list_and_nothing_else() {
         tags
     });
     assert_eq!(value["tags"]["service.name"], "sidevoice-connector");
+    assert_eq!(value["tags"]["os.name"], "Linux");
     assert_eq!(value["tags"]["installation.id"], machine);
     let mut extras = EXTRAS.to_vec();
     extras.sort_unstable();
@@ -1074,6 +1079,23 @@ fn a_record_is_sent_under_its_own_id_and_deleted_once_sentry_took_it() {
         bodies.contains(&id),
         "the connector's own id is the one sent"
     );
+}
+
+#[test]
+fn the_sent_os_name_is_the_one_the_record_was_made_with() {
+    let f = fixture();
+    let server = Sentry::start(200);
+    let mut made = record(1);
+    // Not the context's own ("Linux"): the one stored at panic time must win.
+    made.os_name = "macOS".to_owned();
+    f.store.record(made).unwrap();
+    assert_eq!(
+        drain(&context(&f), &|| Some(true), &server.dsn(), later()),
+        1
+    );
+    let body = String::from_utf8_lossy(&server.requests()[0].1).into_owned();
+    assert!(body.contains(r#""os.name":"macOS""#), "{body}");
+    assert!(!body.contains(r#""os.name":"Linux""#), "{body}");
 }
 
 #[test]

@@ -968,6 +968,13 @@ impl Daemon {
             | "agents.check" => self.host_agents.handle(method, params.clone()).await,
             "connector.error" => json!({}),
             "node.status" => self.node_status().await,
+            "logs.read" => {
+                let files = crate::log_reader::files(&self.profile.data);
+                let params = params.clone();
+                tokio::task::spawn_blocking(move || crate::log_reader::answer(&files, &params))
+                    .await
+                    .unwrap_or_else(|_| json!({"error":{"key":"logs.unreadable"}}))
+            }
             _ => json!({"error":{"key":"connector.unknown-method"}}),
         }
     }

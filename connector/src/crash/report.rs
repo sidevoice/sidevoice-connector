@@ -40,7 +40,13 @@ pub(super) const POST_BUDGET: Duration = Duration::from_secs(10);
 const PASS_BUDGET: Duration = Duration::from_secs(60);
 
 /// The tags an event may carry.
-pub const TAGS: [&str; 4] = ["service.name", "os.type", "host.arch", "installation.id"];
+pub const TAGS: [&str; 5] = [
+    "service.name",
+    "os.type",
+    "os.name",
+    "host.arch",
+    "installation.id",
+];
 /// The `extra` entries an event may carry.
 pub const EXTRAS: [&str; 3] = ["location", "log_tail", "len"];
 
@@ -78,7 +84,7 @@ pub(super) fn release(version: &str) -> Cow<'static, str> {
 }
 
 /// The event of a record, from its closed field list: the Sentry `event_id` is the record's id, the release the
-/// connector's version, and `installation.id` the connector's own random id.
+/// connector's version, `os.name` the one the record was made with and `installation.id` the connector's own random id.
 pub fn event(record: &CrashRecord, machine_id: &str) -> Event<'static> {
     let time = |text: &str| {
         chrono::DateTime::parse_from_rfc3339(text).map_or(SystemTime::now(), SystemTime::from)
@@ -86,6 +92,7 @@ pub fn event(record: &CrashRecord, machine_id: &str) -> Event<'static> {
     let tags = tags([
         ("service.name", SERVICE),
         ("os.type", record.os.as_str()),
+        ("os.name", record.os_name.as_str()),
         ("host.arch", record.arch.as_str()),
         ("installation.id", machine_id),
     ]);
