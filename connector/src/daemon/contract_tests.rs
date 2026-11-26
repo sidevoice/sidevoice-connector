@@ -215,16 +215,11 @@ async fn core_link_frames_with_unknown_fields_and_values_are_read_for_what_they_
         std::slice::from_ref(&frame)
     );
     let envelope = crate::adapters::envelope(&frame).unwrap();
-    let header: Value = serde_json::from_str(envelope.lines().next().unwrap()).unwrap();
     assert_eq!(
-        header,
-        json!({"channel":"voice","session_id":"s","revision":3,"epoch":1,"message_id":"m-1"})
+        envelope.lines().next().unwrap(),
+        "[sidevoice channel=voice session_id=s revision=3 epoch=1 message_id=m-1 style=normal unheard=1 unheard_from=\"earlier…\" heard_up_to=ear]"
     );
     assert!(envelope.contains("\n\nhello"));
-    let line =
-        "The person did not hear the end of your last reply, which began \"earlier…\": they heard up to \"ear\".";
-    assert!(envelope.contains(line), "{envelope}");
-    assert!(envelope.find(line).unwrap() < envelope.find("voice_say (session_id").unwrap());
     assert!(
         !envelope.contains("Reply starting"),
         "fields it does not know are not rendered"

@@ -335,11 +335,8 @@ fn cursor_user_text(entry: &Value) -> Option<String> {
 }
 
 fn cursor_message_id(text: &str) -> Option<String> {
-    let start = text.find("{\"channel\":")?;
-    let tail = &text[start..];
-    let end = tail.find('}')?;
-    serde_json::from_str::<Value>(&tail[..=end])
-        .ok()?
+    super::transcript::voice_headers(text)
+        .first()?
         .get("message_id")?
         .as_str()
         .map(str::to_owned)

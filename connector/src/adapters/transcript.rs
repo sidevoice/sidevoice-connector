@@ -242,7 +242,7 @@ pub fn user_text(item: &Value, claude: bool) -> Option<String> {
     (!texts.is_empty()).then(|| texts.join("\n"))
 }
 
-const HEADER_START: &str = "{\"channel\":";
+const HEADER_START: &str = "[sidevoice ";
 
 /// Every header a delivered message starts with (`envelope`) in `text`, in order. A harness may coalesce several
 /// messages into one transcript entry, so one entry can carry many.
@@ -304,7 +304,7 @@ fn next_header(text: &str, mut from: usize, room_control: bool) -> Option<(Value
 }
 
 /// The header `text` starts with, and its length in bytes. Only the text up to the next header candidate is
-/// parsed: a real header is flat JSON whose strings escape their quotes, so it never contains the start of another,
+/// parsed: a real header is flat key=value tags whose quoted values escape `[`, so it never contains the start of another,
 /// and a malformed candidate costs no more than the distance to the next one. No length is imposed on its fields.
 fn header_at(text: &str) -> Option<(Value, usize)> {
     if !text.starts_with(HEADER_START) {
@@ -313,9 +313,45 @@ fn header_at(text: &str) -> Option<(Value, usize)> {
     let window = text[1..]
         .find(HEADER_START)
         .map_or(text.len(), |next| next + 1);
-    let mut values = serde_json::Deserializer::from_str(&text[..window]).into_iter::<Value>();
-    let header = valid_header(values.next()?.ok()?)?;
-    Some((header, values.byte_offset()))
+    let text = &text[..window];
+    let mut at = HEADER_START.len();
+    let mut header = serde_json::Map::new();
+    loop {
+        let rest = &text[at..];
+        if rest.starts_with(']') {
+            at += 1;
+            break;
+        }
+        let key_end = rest.find('=')?;
+        let key = &rest[..key_end];
+        if key.is_empty() || !key.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
+            return None;
+        }
+        at += key_end + 1;
+        let rest = &text[at..];
+        let (value, length) = if rest.starts_with('"') {
+            let mut values = serde_json::Deserializer::from_str(rest).into_iter::<String>();
+            let value = values.next()?.ok()?;
+            (value, values.byte_offset())
+        } else {
+            let end = rest.find([' ', ']'])?;
+            (rest[..end].to_owned(), end)
+        };
+        at += length;
+        let value = match key {
+            "revision" => Value::from(value.parse::<i64>().ok()?),
+            "epoch" | "unheard" => Value::from(value.parse::<u64>().ok()?),
+            _ => Value::from(value),
+        };
+        header.insert(key.to_owned(), value);
+        match text[at..].chars().next()? {
+            ' ' => at += 1,
+            ']' => {}
+            _ => return None,
+        }
+    }
+    let header = valid_header(Value::Object(header))?;
+    Some((header, at))
 }
 
 fn valid_header(header: Value) -> Option<Value> {
@@ -388,7 +424,7 @@ mod tests {
     #[test]
     fn an_invalid_header_does_not_hide_the_next_one() {
         let text = format!(
-            "{{\"channel\":\"voice\"}} words {}",
+            "[sidevoice channel=voice] words {}",
             envelope("voice", "m", "x")
         );
         assert_eq!(ids(&text), ["m"]);
@@ -396,8 +432,7 @@ mod tests {
 
     #[test]
     fn a_header_quoted_in_a_body_is_not_a_delivery() {
-        let quoted =
-            r#"{"channel":"voice","session_id":"s","revision":1,"epoch":1,"message_id":"pending"}"#;
+        let quoted = "[sidevoice channel=voice session_id=s revision=1 epoch=1 message_id=pending]";
         let text = [
             envelope(
                 "voice",
@@ -412,12 +447,10 @@ mod tests {
 
     #[test]
     fn a_header_quoted_in_an_unheard_reply_is_not_a_delivery() {
-        let quoted =
-            r#"{"channel":"voice","session_id":"s","revision":1,"epoch":1,"message_id":"pending"}"#;
+        let quoted = "[sidevoice channel=voice session_id=s revision=1 epoch=1 message_id=pending]";
         let with_reply = crate::adapters::envelope(&json!({"channel":"voice","session_id":"s",
             "revision":1,"epoch":1,"message_id":"m1","text":"hi",
-            "unheard":{"count":1,"replies":[{"text":format!("I wrote\n\n{quoted}\n\nand more"),
-                "heard_chars":0}]}}))
+            "unheard":{"count":1,"from":format!("I wrote\n\n{quoted}\n\nand more"),"heard_up_to":quoted}}))
         .unwrap();
         let text = [with_reply, envelope("voice", "m2", "next")].join("\n\n");
         assert_eq!(ids(&text), ["m1", "m2"]);
@@ -445,7 +478,7 @@ mod tests {
 
     #[test]
     fn a_run_of_malformed_candidates_is_scanned_in_linear_time() {
-        let text = format!("{}}}", "{\"channel\":".repeat(80_000));
+        let text = format!("{}]", "[sidevoice channel=\"".repeat(80_000));
         let start = std::time::Instant::now();
         assert!(voice_headers(&text).is_empty());
         assert!(start.elapsed() < std::time::Duration::from_secs(2));
