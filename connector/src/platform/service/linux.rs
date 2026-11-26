@@ -394,8 +394,8 @@ fn environment_assignment(name: &str, value: &str) -> String {
     )
 }
 
-/// A user unit: restarted on failure 10 s later ([`Restart::OnFailure`], the core) or always 2 s later
-/// ([`Restart::Always`], the connector), at most [`START_LIMIT`] starts in 10 minutes (then `start-limit-hit`, which
+/// A user unit: restarted on failure 10 s later ([`Restart::OnFailure`], both jobs) or always 2 s later
+/// ([`Restart::Always`], no job now), at most [`START_LIMIT`] starts in 10 minutes (then `start-limit-hit`, which
 /// a restart clears); started with the user's manager. `unset` names variables the job must not inherit from it.
 fn unit_text(job: &Job) -> String {
     let exec = job
@@ -504,6 +504,8 @@ mod tests {
             restart: Restart::OnFailure,
             log: PathBuf::from("/d/core.log"),
             runner: vec![],
+            guarded: vec![],
+            budget: PathBuf::from("/d/test.restarts.json"),
         })
     }
 

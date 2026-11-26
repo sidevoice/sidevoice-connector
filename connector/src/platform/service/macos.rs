@@ -1,6 +1,6 @@
 //! macOS: launchd, through `/bin/launchctl`, in this user's GUI domain (`gui/<uid>`, the uid from `rustix`): one
 //! LaunchAgent per job in `~/Library/LaunchAgents/<label>.plist`. RunAtLoad starts it at login, KeepAlive brings it
-//! back (the core after a crash or a non-zero exit, the connector whenever it exits), ThrottleInterval 10 spaces the
+//! back (each after a crash or a non-zero exit, through `run-guarded`: five starts in ten minutes, then it stays down), ThrottleInterval 10 spaces the
 //! starts; its output goes to the job's log. Whether it starts at login is launchd's override for its label
 //! (`enable` / `disable`), which a plist's RunAtLoad obeys.
 
@@ -45,7 +45,7 @@ impl Service for Os {
     fn program_of(text: &str) -> Option<Vec<String>> {
         plist::from_bytes::<Program>(text.as_bytes())
             .ok()
-            .map(|program| program.program_arguments)
+            .map(|program| unguarded(program.program_arguments))
     }
 
     // A changed plist is loaded again (launchd reads it only when it is bootstrapped); a running job is restarted
@@ -353,12 +353,12 @@ struct Program {
 }
 
 /// A LaunchAgent. [`Restart::OnFailure`]: back after a crash or a non-zero exit, never after exit 0 (the core);
-/// [`Restart::Always`]: back whenever it exits (the connector). At most one start every 10 s. Output to the job's
+/// [`Restart::Always`] (no job now) is written the same. At most one start every 10 s. Output to the job's
 /// log.
 fn plist_text(job: &Job) -> String {
     let agent = Agent {
         label: job.id.label.to_owned(),
-        program_arguments: job.program.clone(),
+        program_arguments: guarded_program(job),
         environment_variables: job.environment.clone(),
         run_at_load: true,
         keep_alive: match job.restart {
@@ -366,7 +366,11 @@ fn plist_text(job: &Job) -> String {
                 successful_exit: false,
                 crashed: true,
             },
-            Restart::Always => KeepAlive::Always(true),
+            // Only a legacy job is read with this; it is written as `OnFailure`.
+            Restart::Always => KeepAlive::Unless {
+                successful_exit: false,
+                crashed: true,
+            },
         },
         throttle_interval: 10,
         standard_out_path: job.log.clone(),
@@ -375,6 +379,27 @@ fn plist_text(job: &Job) -> String {
     let mut text = Vec::new();
     plist::to_writer_xml(&mut text, &agent).expect("a LaunchAgent serializes");
     String::from_utf8(text).expect("plist writes UTF-8")
+}
+
+/// What a LaunchAgent runs: the program behind the budget's guard (`<guarded> <budget file> -- <program>`), or the
+/// program itself where the job has no guard.
+fn guarded_program(job: &Job) -> Vec<String> {
+    if job.guarded.is_empty() {
+        return job.program.clone();
+    }
+    let mut words = job.guarded.clone();
+    words.push(job.budget.to_string_lossy().into_owned());
+    words.push("--".into());
+    words.extend(job.program.iter().cloned());
+    words
+}
+
+/// The program behind a guard's `--`, or the arguments as they are.
+fn unguarded(words: Vec<String>) -> Vec<String> {
+    match words.iter().position(|word| word == "--") {
+        Some(at) if at > 0 => words[at + 1..].to_vec(),
+        _ => words,
+    }
 }
 
 // launchd's own answers and steps, which cannot be phrased for every manager: its text, its overrides.
@@ -431,6 +456,8 @@ mod tests {
             restart,
             log: PathBuf::from("/d/core.stderr.log"),
             runner: vec![],
+            guarded: vec![],
+            budget: PathBuf::from("/d/core.restarts.json"),
         }
     }
 
@@ -444,7 +471,9 @@ mod tests {
         let keep_alive = core["KeepAlive"].as_dictionary().unwrap();
         assert_eq!(keep_alive["SuccessfulExit"].as_boolean(), Some(false));
         assert_eq!(keep_alive["Crashed"].as_boolean(), Some(true));
-        assert_eq!(connector["KeepAlive"].as_boolean(), Some(true));
+        let connector_keep = connector["KeepAlive"].as_dictionary().unwrap();
+        assert_eq!(connector_keep["SuccessfulExit"].as_boolean(), Some(false));
+        assert_eq!(connector_keep["Crashed"].as_boolean(), Some(true));
         assert_eq!(core["Label"].as_string(), Some("ai.sidevoice.core"));
         assert_eq!(core["RunAtLoad"].as_boolean(), Some(true));
         assert_eq!(core["ThrottleInterval"].as_signed_integer(), Some(10));
@@ -462,6 +491,26 @@ mod tests {
             "/d/core & <x>",
             "escaped by plist, read back by plist"
         );
+    }
+
+    #[test]
+    fn a_guarded_job_runs_its_program_behind_the_budget_and_reads_back_the_same_program() {
+        let mut guarded = job(Restart::OnFailure, "ai.sidevoice.core");
+        guarded.guarded = vec!["/r/sidevoice-connector".into(), "run-guarded".into()];
+        let text = plist_text(&guarded);
+        let words = plist::from_bytes::<Program>(text.as_bytes())
+            .unwrap()
+            .program_arguments;
+        assert_eq!(
+            words[..4],
+            [
+                "/r/sidevoice-connector",
+                "run-guarded",
+                "/d/core.restarts.json",
+                "--"
+            ]
+        );
+        assert_eq!(Os::program_of(&text).unwrap(), guarded.program);
     }
 
     #[tokio::test]

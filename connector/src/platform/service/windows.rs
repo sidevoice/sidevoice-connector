@@ -18,7 +18,7 @@
 //! closing it would end the job; [`Service::BACKGROUND`]) on the job's definition, `<data>/service/<name>.json`
 //! ([`Stored`]), which does both ([`Service::run_job`](super::Service::run_job)). Task Scheduler cannot tell a job's
 //! pid or count its restarts: a job runs when this user has a process running its program, and restarts are not
-//! reported. It also brings a task back only after a failure, so a connector that exits cleanly stays down until
+//! reported. `run-job` keeps the same restart budget as the other managers (`budget`: five starts in ten minutes, then it exits 0). It also brings a task back only after a failure, so a connector that exits cleanly stays down until
 //! the next login or start. `/End` is a hard stop, so a job's process is first asked to leave
 //! ([`Process::ask_to_leave`]: its stop event, which the core and the connector daemon listen on) and given
 //! [`STOP_GRACE`]; `/End` ends what is still there, and the background program's Job Object (kill on close) ends the connector's tree
@@ -558,6 +558,7 @@ mod tests {
             unset: vec![],
             log: PathBuf::from("C:\\d\\core.log"),
             runner: runner.iter().map(|word| (*word).to_owned()).collect(),
+            budget: PathBuf::from("C:\\d\\core.restarts.json"),
         }
     }
 

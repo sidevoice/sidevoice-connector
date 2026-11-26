@@ -35,6 +35,9 @@ mod imp;
 #[path = "service/launchd.rs"]
 mod launchd;
 
+pub mod budget;
+pub mod supervise;
+
 pub use imp::Os as Services;
 
 use super::fs::{Create, Files, Fs};
@@ -47,6 +50,7 @@ use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicI32, Ordering};
 use tokio::process::Command;
 use tokio::time::Duration;
 
@@ -75,7 +79,8 @@ pub struct JobId {
 pub enum Restart {
     /// After a crash or a non-zero exit, never after exit 0.
     OnFailure,
-    /// Whenever it exits.
+    /// Whenever it exits. No job is defined so: a job that exits 0 has done with it on every OS, and the budget
+    /// keeps a spent one down. Only the legacy launchd jobs were (`service::legacy`), read to retire them.
     Always,
 }
 
@@ -94,6 +99,12 @@ pub struct Job {
     /// The command that runs a job from its definition file ([`Service::run_job`], the file appended), for a
     /// manager that cannot set a job's environment and output itself (Task Scheduler).
     pub runner: Vec<String>,
+    /// The command that runs a program under the restart budget ([`budget`]; the budget file and `--` then the
+    /// program appended), for a manager that has no cap of its own and sets the environment and output itself
+    /// (launchd).
+    pub guarded: Vec<String>,
+    /// Where the restart budget is kept ([`budget`]): the job's starts still in the window, and why it is down.
+    pub budget: PathBuf,
 }
 
 impl Job {
@@ -109,10 +120,11 @@ impl Job {
             }
         };
         plain(self.description, "description")?;
-        for word in self.program.iter().chain(&self.runner) {
+        for word in self.program.iter().chain(&self.runner).chain(&self.guarded) {
             plain(word, "program")?;
         }
         plain(&self.log.to_string_lossy(), "log")?;
+        plain(&self.budget.to_string_lossy(), "budget")?;
         for name in self
             .environment
             .keys()
@@ -442,6 +454,7 @@ pub trait Service: Sized + Send + Sync {
                 .split_first()
                 .ok_or_else(|| io::Error::other("no program"))?;
             let log = Files::open_private(&job.log, Create::Append)?;
+            let mut said = log.try_clone()?;
             let mut command = Command::new(program);
             command
                 .args(args)
@@ -452,8 +465,48 @@ pub trait Service: Sized + Send + Sync {
             for name in &job.unset {
                 command.env_remove(name);
             }
-            let mut child = Processes::spawn_tree(command).await?;
-            Ok(child.wait().await?.code().unwrap_or(1))
+            budget::guarded(&job.budget, budget::now(), &mut said, || async move {
+                let mut child = Processes::spawn_tree(command).await?;
+                Ok(child.wait().await?.code().unwrap_or(1))
+            })
+            .await
+        }
+    }
+
+    /// Runs `program` under the restart budget in `file` ([`budget::guarded`]), as a manager that has no cap of its
+    /// own starts a job whose environment and output it sets itself (launchd): the program inherits both. A stop
+    /// signal for the guard is passed on to the program and waited for ([`supervise`]), and the guard ends the way the
+    /// program did: its exit code, or the signal it died of. 0, and not run, when the budget is spent.
+    fn run_guarded(
+        file: &Path,
+        program: &[String],
+    ) -> impl Future<Output = io::Result<i32>> + Send {
+        async move {
+            let (program, args) = program
+                .split_first()
+                .ok_or_else(|| io::Error::other("no program"))?;
+            let mut command = Command::new(program);
+            command.args(args);
+            let mut signals = supervise::Signals::install()?;
+            let died_of = AtomicI32::new(0);
+            let (signals, died_of_ref) = (&mut signals, &died_of);
+            let code = budget::guarded(file, budget::now(), &mut io::stderr(), || async move {
+                let mut child = Processes::spawn_tree(command).await?;
+                Ok(match signals.supervise(&mut child).await? {
+                    supervise::Ended::Code(code) => code,
+                    supervise::Ended::Signal(signal) => {
+                        died_of_ref.store(signal, Ordering::SeqCst);
+                        128 + signal
+                    }
+                })
+            })
+            .await?;
+            // The program, and with it its tree, is gone: now the guard dies of what it died of.
+            let signal = died_of.load(Ordering::SeqCst);
+            if signal != 0 {
+                supervise::raise(signal);
+            }
+            Ok(code)
         }
     }
 }
@@ -467,6 +520,7 @@ pub struct Stored {
     pub unset: Vec<String>,
     pub log: PathBuf,
     pub runner: Vec<String>,
+    pub budget: PathBuf,
 }
 
 impl From<&Job> for Stored {
@@ -478,6 +532,7 @@ impl From<&Job> for Stored {
             unset: job.unset.iter().map(|name| (*name).to_owned()).collect(),
             log: job.log.clone(),
             runner: job.runner.clone(),
+            budget: job.budget.clone(),
         }
     }
 }
@@ -702,6 +757,8 @@ mod tests {
             restart: Restart::OnFailure,
             log: PathBuf::from("/d/test.log"),
             runner: vec!["/r/current/sidevoice-connector".into(), "run-job".into()],
+            guarded: vec![],
+            budget: PathBuf::from("/d/test.restarts.json"),
         }
     }
 

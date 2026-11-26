@@ -82,6 +82,14 @@ enum Action {
     /// Scheduler): the job its definition file describes.
     #[command(hide = true)]
     RunJob { definition: std::path::PathBuf },
+    /// A program under the restart budget, as launchd runs a job (it sets the environment and output itself but
+    /// has no cap on restarts): the program, run unless it has stopped too often.
+    #[command(hide = true)]
+    RunGuarded {
+        budget: std::path::PathBuf,
+        #[arg(last = true, required = true)]
+        program: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -241,6 +249,10 @@ async fn run(action: Action, json: bool) -> Result<ExitCode> {
         let code = Services::run_job(definition).await?;
         return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
     }
+    if let Action::RunGuarded { budget, program } = &action {
+        let code = Services::run_guarded(budget, program).await?;
+        return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
+    }
     if let Action::StageCore { release } = &action {
         let installed = core_package::install(&core_package::package_root()?, release)?;
         if json {
@@ -336,7 +348,9 @@ async fn run(action: Action, json: bool) -> Result<ExitCode> {
         Action::StageCore { .. } => unreachable!("the core is staged before the profile"),
         #[cfg(feature = "testbench")]
         Action::BenchAgents => unreachable!("the bench is answered before the profile"),
-        Action::RunJob { .. } => unreachable!("a job runs before the profile"),
+        Action::RunJob { .. } | Action::RunGuarded { .. } => {
+            unreachable!("a job runs before the profile")
+        }
     }
 }
 

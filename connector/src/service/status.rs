@@ -10,6 +10,7 @@ use crate::platform::fs::{Files, Fs};
 use crate::platform::holders::{Holder, Holders, Holding};
 use crate::platform::ipc::Endpoint;
 use crate::platform::process::{Process, Processes};
+use crate::platform::service::budget;
 use crate::platform::service::{JobState, Service, Services};
 use serde_json::{json, Value};
 use std::fs;
@@ -39,6 +40,10 @@ pub struct Observation {
     /// The core's own report of its last failed start, as a person reads it.
     pub failure: Option<Value>,
     pub core_age: Option<u64>,
+    /// The ready core is the core job's process or was started by it (through a few generations). On macOS the job's
+    /// process is the guard (`run-guarded`) that started the core, so the two pids differ and the core is still the
+    /// job's.
+    pub ready_under_job: bool,
     /// Why the core job's program cannot run, if it cannot.
     pub program: Option<&'static str>,
     pub log_tail: Vec<String>,
@@ -109,7 +114,7 @@ pub fn derive(o: &Observation) -> Value {
         None => {
             let job = job.cloned().unwrap_or_default();
             if job.running {
-                if o.ready.as_ref().map(|ready| ready.pid) != job.pid {
+                if o.ready.as_ref().map(|ready| ready.pid) != job.pid && !o.ready_under_job {
                     if o.core_age.is_some_and(|age| age > STARTING_SECONDS) {
                         ("failed", Some(failed("ready.timeout", "ready", None)))
                     } else {
@@ -334,9 +339,25 @@ pub async fn observe(layout: &Layout, connector_running: Option<bool>) -> Observ
     let service = jobs::manager(layout);
     let defined_core = installed.as_ref().is_some_and(|found| found.core);
     let defined_connector = installed.as_ref().is_some_and(|found| found.connector);
+    let ready = read_ready(layout);
+    let health = match ready.as_ref().map(|ready| &ready.endpoint) {
+        Some(endpoint) => health(endpoint, Duration::from_millis(1500)).await,
+        None => None,
+    };
     let (core_job, core_job_text, program) = if defined_core {
         let program = service.program(Job::Core.id()).await;
-        let diagnosis = service.diagnose(Job::Core.id()).await;
+        let mut diagnosis = service.diagnose(Job::Core.id()).await;
+        // Linux's systemd says it itself (`start-limit-hit`). launchd and Task Scheduler have no cap: the guard that
+        // keeps their budget leaves its mark in a file. Same reason, so the same state on every OS.
+        // A core that answers is up whoever started it: a mark from before is stale, and goes.
+        if health.is_some() {
+            budget::clear_down(&layout.restarts(Job::Core));
+        } else if !diagnosis.job.running
+            && diagnosis.job.reason.is_none()
+            && budget::load(&layout.restarts(Job::Core)).down.is_some()
+        {
+            diagnosis.job.reason = Some("start-limit");
+        }
         (
             Some(diagnosis.job.clone()),
             Some(diagnosis.to_string()),
@@ -344,11 +365,6 @@ pub async fn observe(layout: &Layout, connector_running: Option<bool>) -> Observ
         )
     } else {
         (None, None, None)
-    };
-    let ready = read_ready(layout);
-    let health = match ready.as_ref().map(|ready| &ready.endpoint) {
-        Some(endpoint) => health(endpoint, Duration::from_millis(1500)).await,
-        None => None,
     };
     let at = crate::logfile::timestamp();
     let core_age = match core_job
@@ -358,6 +374,13 @@ pub async fn observe(layout: &Layout, connector_running: Option<bool>) -> Observ
     {
         Some(pid) => Processes::age(pid),
         None => None,
+    };
+    let ready_under_job = match (
+        ready.as_ref().map(|ready| ready.pid),
+        core_job.as_ref().and_then(|job| job.pid),
+    ) {
+        (Some(pid), Some(job)) => within(pid, job, Processes::parent),
+        _ => false,
     };
     let start_at_login = match &installed {
         Some(found) => jobs::start_at_login(&service, found).await,
@@ -393,12 +416,29 @@ pub async fn observe(layout: &Layout, connector_running: Option<bool>) -> Observ
         ready,
         failure,
         core_age,
+        ready_under_job,
         program,
         log_tail: log_tail(layout, 10),
         connector_running,
         start_at_login,
         at,
     }
+}
+
+/// Whether `pid` is `ancestor` or was started by it, through a few generations (a launcher script between the guard
+/// and the core is one). `parent` answers who started a process.
+fn within(pid: u32, ancestor: u32, parent: impl Fn(u32) -> Option<u32>) -> bool {
+    let mut current = pid;
+    for _ in 0..4 {
+        if current == ancestor {
+            return true;
+        }
+        match parent(current) {
+            Some(next) if next > 1 => current = next,
+            _ => return false,
+        }
+    }
+    current == ancestor
 }
 
 /// `service status --json`: derived, read-only, never starts anything.
@@ -482,6 +522,20 @@ mod tests {
     }
 
     #[test]
+    fn a_core_is_the_jobs_when_a_guard_or_a_script_started_it() {
+        let parents = |pid: u32| match pid {
+            30 => Some(20),
+            20 => Some(10),
+            10 => Some(1),
+            _ => None,
+        };
+        assert!(within(10, 10, parents));
+        assert!(within(30, 10, parents));
+        assert!(!within(30, 11, parents));
+        assert!(!within(10, 30, parents));
+    }
+
+    #[test]
     fn the_service_condition_wins_over_a_healthy_core() {
         let mut o = running();
         o.stopped = true;
@@ -496,6 +550,16 @@ mod tests {
         let status = derive(&o);
         assert_eq!(status["state"], "service-failed");
         assert_eq!(status["failure"]["key"], "start-limit");
+
+        // A guard's core: the job's pid is the guard's. Not started by it, the core is not the job's; started by it,
+        // it is (and a silent health is a hang, not a core that never came).
+        let mut o = running();
+        o.health = None;
+        o.core_age = Some(100);
+        o.core_job.as_mut().unwrap().pid = Some(900);
+        assert_eq!(derive(&o)["failure"]["key"], "ready.timeout");
+        o.ready_under_job = true;
+        assert_eq!(derive(&o)["failure"]["key"], "hang");
 
         let mut o = running();
         o.program = Some("executable-missing");
