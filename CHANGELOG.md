@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.22.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.21.0...v0.22.0) (2026-11-26)
+
+
+### Features
+
+* **logs:** answer the core's logs.read from the connector's own log ([#375](https://github.com/sidevoice/sidevoice-connector/issues/375)) ([7832faa](https://github.com/sidevoice/sidevoice-connector/commit/7832faa2c32d72b2258f30c925f83f5b80b875e9))
+* **mcp:** rejoin voice by itself when the agent's session starts again ([#383](https://github.com/sidevoice/sidevoice-connector/issues/383)) ([7b13e26](https://github.com/sidevoice/sidevoice-connector/commit/7b13e26fa67e85c6d91e683e9901b399adec86df))
+
+
+### Bug Fixes
+
+* **crash-reports:** send os.name with crash reports ([#374](https://github.com/sidevoice/sidevoice-connector/issues/374)) ([20d3b03](https://github.com/sidevoice/sidevoice-connector/commit/20d3b03c75f5f53712dfed8ed0415cf6f2a1429e))
+* **service:** stop restarting a crashing service after five tries on every OS ([#377](https://github.com/sidevoice/sidevoice-connector/issues/377)) ([12d59be](https://github.com/sidevoice/sidevoice-connector/commit/12d59bebd46ff595734e903b6b66ac7d0990208f))
+
 ## [0.21.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.20.0...v0.21.0) (2026-11-18)
 
 
