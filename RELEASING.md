@@ -1,5 +1,7 @@
 # Releasing
 
+This file is self-sufficient: it holds what anyone needs to build, release and download this repository. The maintainers also follow an internal release guideline shared by all Sidevoice repositories ([releasing guideline](https://github.com/sidevoice/.github-private/blob/main/docs/releasing.md), maintainers only; nothing here depends on it).
+
 One version for the connector, tagged `vX.Y.Z`. It lives in `connector/Cargo.toml` (the build tooling at
 the workspace root and `testbench/` carry the same one, and `Cargo.lock` both); release-please moves them together
 (`release-please-config.json`). Never edit it by hand. The connector is distributed as GitHub Releases of this
@@ -15,7 +17,7 @@ The earlier Node package, `@sidevoice/uplink` on npm, is deprecated and no longe
 | Open / update a PR | anyone | `ci`: format and Clippy (Linux and macOS), then on every target the tests, the release packaging (`cargo xtask dist`) and its npm packages, installed and run (`cargo xtask npm`, `npm-smoke`); then each archive installed [end to end](#end-to-end) on a fresh runner of its OS; publishing nothing. **PR title is a conventional commit**. |
 | Squash-merge into `main` | reviewer | The PR title becomes the commit. `release` runs: per target it runs the tests, builds and packages the connector, and installs that archive [end to end](#end-to-end); only then it attests the assets, attaches them to the `nightly` pre-release, reads them back, verifies them and publishes. release-please opens or updates the **release PR** ("chore(main): release X.Y.Z"). |
 | Merge the release PR | a maintainer | **This is the release.** release-please tags `vX.Y.Z` and creates a draft GitHub Release whose notes are that version's changelog; `release` runs from the tag, attaches and verifies the assets, and publishes the Release; then it publishes the platform packages to npm and **stages** the launcher `sidevoice`. |
-| Approve the staged `sidevoice` on npmjs.com | a maintainer (2FA) | The version reaches people: `npx sidevoice` installs it (dist-tag `latest`, or `next` for a candidate). |
+| Approve the staged `sidevoice` on npmjs.com | a maintainer (2FA), other than the one who cut the release | The version reaches people: `npx sidevoice` installs it (dist-tag `latest`, or `next` for a candidate). |
 
 The tests are part of the build: an asset is only produced on a target where the whole suite passed. Everything
 besides the GitHub steps is code in `xtask/` (`cargo xtask fixtures | dist | verify | verify-floor | manifest |
@@ -167,7 +169,7 @@ Every `vX.Y.Z` release (never the nightly) is also published to npm, as four pac
 | Package | What it carries | dist-tag | How it is published |
 |---|---|---|---|
 | `@sidevoice/sidevoice-darwin-arm64`, `@sidevoice/sidevoice-linux-x64`, `@sidevoice/sidevoice-linux-arm64` | That target's release archive unpacked as it is (`bin/sidevoice-connector`, `connector.json`, the core archive under `core/`, `LICENSE`, `notices/`), a `package.json` with `os`, `cpu` and on Linux `libc: ["glibc"]`, and a README. **No `bin`**: the binary just lives in the package. | `platform` | directly, with provenance |
-| `sidevoice` | `optionalDependencies` on the three at **exactly** its own version (no ranges), and one script, `bin/sidevoice.js` (`xtask/npm/sidevoice.js`, plain JavaScript, no dependencies): it runs the installed platform package's binary with the same arguments, standard streams and exit status, and says clearly when the platform is unsupported or its package is missing. The only package with a `bin`: `sidevoice`. | `latest` for `X.Y.Z`, `next` for `X.Y.Z-rc.N` | **staged**, with provenance; a maintainer approves it |
+| `sidevoice` | `optionalDependencies` on the three at **exactly** its own version (no ranges), and one script, `bin/sidevoice.js` (`xtask/npm/sidevoice.js`, plain JavaScript, no dependencies): it runs the installed platform package's binary with the same arguments, standard streams and exit status, and says clearly when the platform is unsupported or its package is missing. The only package with a `bin`: `sidevoice`. | `latest` for `X.Y.Z`, `next` for `X.Y.Z-rc.N` | **staged**, with provenance; a maintainer (2FA), other than the one who cut the release, approves it |
 
 npm installs, of the launcher's optional dependencies, only the one matching the machine. The connector finds its
 package by its own path (the directory above its `bin/`), so it runs from `node_modules` exactly as from the archive.
@@ -190,7 +192,7 @@ published, for versioned releases only, as one step, `cargo xtask npm-publish vX
    published with the same bytes is skipped, so a re-run carries on; with other bytes it fails.
 
 Success means **"platform packages published, launcher staged awaiting approval"**; the job's last line says so,
-with the stage id. A maintainer approves it on npmjs.com (`sidevoice` → staged versions) or with
+with the stage id. A maintainer (2FA), other than the one who cut the release, approves it on npmjs.com (`sidevoice` → staged versions) or with
 `npm stage approve <id>`, both with 2FA. Until then `npx sidevoice` keeps installing the previous version.
 
 Why this shape:
@@ -251,7 +253,7 @@ only Windows distribution here).
 ## Which version comes next
 
 `fix:` → patch, `feat:` → minor. While the version is 0.x a breaking change (`feat!:` or a `BREAKING CHANGE:`
-footer) bumps the minor, not the major. `docs:`, `chore:`, `ci:`, `test:`, `refactor:` alone make no release.
+footer) bumps the minor, not the major. `docs:`, `chore:`, `ci:`, `test:`, `refactor:` alone make no release. The core is bundled: a PR that moves the `sidevoice-platform` tag (the core repository's library) is a change of the connector and is titled `fix(deps): ...` (guideline, section 1), not `chore`.
 
 The manifest starts at 0.6.0, the version the npm package carried. release-please finds the tag `v0.6.0` and reads
 the history from it; without that tag it reads from the commit where this repository became the client alone
@@ -291,6 +293,8 @@ Build artifacts on Actions runs are kept 7 days, for debugging only. Download fr
   connector's tests against that core.
 
 ## What this needs from the repository settings
+
+Set by the maintainers in the repository and on npmjs.com; nothing for anyone else to do.
 
 - Settings → Actions → General → **Allow GitHub Actions to create and approve pull requests**: without it
   release-please cannot open its PR.
