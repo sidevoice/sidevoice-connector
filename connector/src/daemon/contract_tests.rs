@@ -94,10 +94,10 @@ pub(super) fn play_core(link: Arc<Link>, mut frames: tokio::sync::mpsc::Receiver
                     "error":null,"epoch":0,"initial_reply_context":{"thread_id":params["thread"],"session_id":format!("binding:core-{}", params["client_ref"].as_str().unwrap()),"revision":0,"epoch":0},"status":"registered_somewhere_new","future":{"nested":{"x":1}}})
                 }
                 Some("speech.publish") => {
-                    if params["text"] == "during turn" {
+                    if params["text"] == "unknown context" {
                         json!({"event_id":params["event_id"],"utterance_id":params["utterance_id"],
-                            "status":"rejected","terminal":true,"reason":"user_speaking",
-                            "instruction":"The person is speaking; wait for their message."})
+                            "status":"rejected","terminal":true,"error":"room.speech_context_invalid","reason_code":"application_refusal",
+                            "future":{"nested":true}})
                     } else {
                         json!({"event_id":params["event_id"],"utterance_id":params["utterance_id"],
                         "text_saved":true,"status":"a_status_from_the_future","reason":"new_reason",
@@ -262,12 +262,12 @@ async fn core_link_frames_with_unknown_fields_and_values_are_read_for_what_they_
             1,
             "publish",
             json!({"client_ref":"t-1","session_id":"s",
-        "revision":3,"epoch":1,"text":"during turn"}),
+        "revision":3,"epoch":1,"text":"unknown context"}),
         )
         .await
         .unwrap();
     assert_eq!(refused["status"], "rejected", "{refused}");
-    assert_eq!(refused["reason"], "user_speaking", "{refused}");
+    assert_eq!(refused["error"], "room.speech_context_invalid", "{refused}");
     assert!(
         daemon.outbox.lock().await.is_empty(),
         "a terminal refusal cannot retry as speech"
@@ -326,13 +326,12 @@ async fn unresolved_other_conversation_does_not_hide_live_refusal() {
             2,
             "publish",
             json!({"client_ref":"b","session_id":"s",
-        "revision":1,"epoch":0,"text":"during turn"}),
+        "revision":1,"epoch":0,"text":"unknown context"}),
         )
         .await
         .unwrap();
     assert_eq!(refused["status"], "rejected", "{refused}");
-    assert_eq!(refused["reason"], "user_speaking", "{refused}");
-    assert!(refused["instruction"].as_str().unwrap().contains("wait"));
+    assert_eq!(refused["error"], "room.speech_context_invalid", "{refused}");
     let outbox = daemon.outbox.lock().await;
     assert_eq!(outbox.len(), 1, "{outbox:?}");
     assert_eq!(outbox[0]["event_id"], "event-a");
@@ -428,7 +427,7 @@ async fn lost_admission_recovers_original_and_does_not_bar_new_audio() {
                     assert!(params.get("attempted").is_none());
                     let result = if outcome == "refused" {
                         json!({"event_id":params["event_id"],"utterance_id":params["utterance_id"],
-                            "status":"rejected","terminal":true,"reason":"user_speaking"})
+                            "status":"rejected","terminal":true,"error":"room.speech_context_invalid","reason_code":"application_refusal"})
                     } else {
                         json!({"event_id":params["event_id"],"utterance_id":params["utterance_id"],
                             "status":if outcome == "missing" { "text_only" } else { "published" },
