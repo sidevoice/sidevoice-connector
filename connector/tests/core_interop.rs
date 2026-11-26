@@ -1595,3 +1595,250 @@ fn t07_t16_detachable_pull_claim_reaches_the_next_real_ipc_owner() {
     assert_eq!(acknowledged["acknowledged"], 1, "{acknowledged}");
     assert_eq!(acknowledged["count"], 0, "{acknowledged}");
 }
+
+#[test]
+fn a_conversation_rejoins_by_itself_when_its_mcp_server_starts_again_until_it_leaves() {
+    let Some(core) = core_dir() else { return };
+    let profile = Profile::new("rejoin");
+    let _core = profile.start_core(&core, "rejoin-core");
+    let _connector = profile.start_connector();
+    profile.wait_linked("rejoin-core");
+    let thread = "rejoin-thread";
+    let start = |label: &str| {
+        let mut command = profile.connector(&["mcp"]);
+        command.env("SIDEVOICE_THREAD", thread);
+        let mut mcp = Mcp::start(command);
+        mcp.initialize(label);
+        mcp
+    };
+    let records =
+        || std::fs::read_dir(profile.data().join("rejoin")).map_or(0, |entries| entries.count());
+
+    let mut mcp = start("rejoin-first");
+    mcp.tool("voice_connect", json!({}));
+    assert_eq!(records(), 1);
+    mcp.stop();
+
+    // A new server for the same conversation joins without voice_connect.
+    let mut mcp = start("rejoin-second");
+    let status = until("the conversation rejoined by itself", 15, || {
+        let status = mcp.tool("voice_status", json!({}));
+        (status["joined"] == true).then_some(status)
+    });
+    assert_eq!(status["conversation"], thread, "{status}");
+
+    // Leaving removes the record: the next server does not rejoin.
+    mcp.tool("voice_disconnect", json!({}));
+    assert_eq!(records(), 0);
+    mcp.stop();
+    let mut mcp = start("rejoin-third");
+    let status = mcp.tool("voice_status", json!({}));
+    assert_ne!(status["joined"], true, "{status}");
+    mcp.stop();
+}
+
+/// A conversation the person closes while no MCP server of its agent runs (so the connector holds no binding the core
+/// could tell) stays closed when the agent's session starts again: the rejoin is a resume the core refuses, and its
+/// record goes.
+#[test]
+fn a_conversation_closed_while_its_agent_is_away_does_not_rejoin_by_itself() {
+    let Some(core) = core_dir() else { return };
+    let profile = Profile::new("rejoinclosed");
+    let _core = profile.start_core(&core, "rejoin-closed-core");
+    let _connector = profile.start_connector();
+    profile.wait_linked("rejoin-closed-core");
+    let call = Presentation::open(&profile.core_endpoint());
+    let thread = "rejoin-closed-thread";
+    let start = |label: &str| {
+        let mut command = profile.connector(&["mcp"]);
+        command.env("SIDEVOICE_THREAD", thread);
+        let mut mcp = Mcp::start(command);
+        mcp.initialize(label);
+        mcp
+    };
+    let records =
+        || std::fs::read_dir(profile.data().join("rejoin")).map_or(0, |entries| entries.count());
+    let participants = || {
+        core_json(
+            &profile.core_endpoint(),
+            "GET",
+            "/api/presentation/participants",
+            None,
+            Some(&call.token),
+        )
+    };
+
+    let mut mcp = start("rejoin-closed-first");
+    mcp.tool("voice_connect", json!({"title":"Closed while away"}));
+    assert_eq!(records(), 1);
+    mcp.stop();
+    until("the connector let go of the binding", 15, || {
+        (participants()["participants"].as_array()?.is_empty()).then_some(())
+    });
+
+    // The person closes it in the app while nothing of the agent runs.
+    core_json(
+        &profile.core_endpoint(),
+        "POST",
+        "/api/presentation/close",
+        Some(&json!({"thread_id": thread})),
+        Some(&call.token),
+    );
+
+    let mut mcp = start("rejoin-closed-second");
+    until("the refused rejoin removed the record", 15, || {
+        (records() == 0).then_some(())
+    });
+    let status = mcp.tool("voice_status", json!({}));
+    assert_ne!(status["joined"], true, "{status}");
+    let view = participants();
+    assert!(
+        view["participants"].as_array().unwrap().is_empty(),
+        "{view}"
+    );
+    assert!(
+        view["closed_threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == thread),
+        "{view}"
+    );
+    mcp.stop();
+
+    // Nothing comes back on a later start either.
+    let mut mcp = start("rejoin-closed-third");
+    std::thread::sleep(Duration::from_secs(2));
+    let status = mcp.tool("voice_status", json!({}));
+    assert_ne!(status["joined"], true, "{status}");
+    assert!(participants()["participants"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    mcp.stop();
+}
+
+/// A conversation one device removed while its agent was away rejoins for the devices that still show it, and stays
+/// removed from that device: the rejoin is a resume, not the agent connecting anew (which would bring it back to all).
+#[test]
+fn a_rejoin_keeps_a_conversation_removed_from_a_device() {
+    let Some(core) = core_dir() else { return };
+    let profile = Profile::new("rejoinremoved");
+    let _core = profile.start_core(&core, "rejoin-removed-core");
+    let _connector = profile.start_connector();
+    profile.wait_linked("rejoin-removed-core");
+    let removing = Presentation::open(&profile.core_endpoint());
+    let keeping = Presentation::open_second(&profile);
+    let thread = "rejoin-removed-thread";
+    let start = |label: &str| {
+        let mut command = profile.connector(&["mcp"]);
+        command.env("SIDEVOICE_THREAD", thread);
+        let mut mcp = Mcp::start(command);
+        mcp.initialize(label);
+        mcp
+    };
+    let shows = |device: &Presentation| {
+        core_json(
+            &profile.core_endpoint(),
+            "GET",
+            "/api/presentation/participants",
+            None,
+            Some(&device.token),
+        )["participants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["thread_id"] == thread)
+    };
+
+    let mut mcp = start("rejoin-removed-first");
+    mcp.tool("voice_connect", json!({"title":"Removed from one device"}));
+    until("both devices show the conversation", 15, || {
+        (shows(&removing) && shows(&keeping)).then_some(())
+    });
+    mcp.stop();
+    until("the connector let go of the binding", 15, || {
+        (!shows(&keeping)).then_some(())
+    });
+
+    let removed = core_json(
+        &profile.core_endpoint(),
+        "POST",
+        "/api/presentation/remove",
+        Some(&json!({"thread_id": thread})),
+        Some(&removing.token),
+    );
+    assert_eq!(removed["closed"], false, "{removed}");
+
+    let mut mcp = start("rejoin-removed-second");
+    until("the conversation rejoined by itself", 15, || {
+        let status = mcp.tool("voice_status", json!({}));
+        (status["joined"] == true).then_some(())
+    });
+    until("the keeping device shows it again", 15, || {
+        shows(&keeping).then_some(())
+    });
+    assert!(!shows(&removing), "the removing device shows it again");
+    mcp.stop();
+}
+
+/// The pod restarts: the core comes back without what it knew (no binding of the old id, no conversation) and so does
+/// the connector. The agent's MCP server starts again: the core does not know the recorded binding, so the rejoin is
+/// the conversation joining anew, and its record carries the new binding id.
+#[test]
+fn a_conversation_rejoins_after_the_core_lost_its_state_and_records_the_new_binding() {
+    let Some(core) = core_dir() else { return };
+    let profile = Profile::new("rejoinlost");
+    let mut core_process = profile.start_core(&core, "rejoin-lost-core-1");
+    let mut connector = profile.start_connector();
+    profile.wait_linked("rejoin-lost-core-1");
+    let thread = "rejoin-lost-thread";
+    let start = |label: &str| {
+        let mut command = profile.connector(&["mcp"]);
+        command.env("SIDEVOICE_THREAD", thread);
+        let mut mcp = Mcp::start(command);
+        mcp.initialize(label);
+        mcp
+    };
+    let recorded = || {
+        let dir = profile.data().join("rejoin");
+        let entry = std::fs::read_dir(dir).ok()?.flatten().next()?;
+        read_json(&entry.path())
+    };
+
+    let mut mcp = start("rejoin-lost-first");
+    mcp.tool("voice_connect", json!({"title":"Across a restart"}));
+    let old = recorded().expect("the join left a record")["binding_id"]
+        .as_str()
+        .expect("a core binding id")
+        .to_owned();
+    mcp.stop();
+    connector.stop();
+    core_process.stop();
+
+    // The core's disk is gone (a new pod): everything it kept is removed, the connector's own state stays.
+    for entry in std::fs::read_dir(profile.core_data()).unwrap().flatten() {
+        let path = entry.path();
+        let _ = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+    }
+    let _core_process = profile.start_core(&core, "rejoin-lost-core-2");
+    let _connector = profile.start_connector();
+    profile.wait_linked("rejoin-lost-core-2");
+
+    let mut mcp = start("rejoin-lost-second");
+    let status = until("the conversation rejoined by itself", 30, || {
+        let status = mcp.tool("voice_status", json!({}));
+        (status["joined"] == true).then_some(status)
+    });
+    assert_eq!(status["conversation"], thread, "{status}");
+    let new = until("the record carries the new binding id", 30, || {
+        let id = recorded()?["binding_id"].as_str()?.to_owned();
+        (id != old).then_some(id)
+    });
+    assert!(!new.starts_with("local-"), "{new}");
+    mcp.stop();
+}

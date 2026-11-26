@@ -406,6 +406,19 @@ impl Daemon {
         Ok(())
     }
 
+    /// The core refused to renew `binding` because its conversation was closed while this daemon did not hold it (the
+    /// person closed or removed it, or it expired): it is closed here too, so it stays closed, and the register is
+    /// refused as for any closed conversation.
+    async fn close_refused_resume(&self, binding: &Arc<Binding>) -> anyhow::Error {
+        if let Err(error) = self
+            .close_binding_from_client(binding, "binding_closed")
+            .await
+        {
+            return error;
+        }
+        anyhow::anyhow!("CLOSED_BY_CLIENT:binding_closed:{}", binding.client_ref)
+    }
+
     /// A new Core confirms a leave only after persisting it. An older Core returns no confirmation, so the
     /// record stays pending until a compatible Core answers. Call while holding conversation_state_serial.
     async fn confirm_agent_leave(&self, client_ref: &str, leave: &Value) -> Result<()> {
@@ -1219,6 +1232,15 @@ impl Daemon {
                     .filter(|url| !url.is_empty())
                     .map(str::to_owned);
                 let detachable = params.get("detachable") == Some(&json!(true));
+                // A resume names the core binding it renews, also one this daemon no longer holds (its façade went
+                // away and the agent's session started again): the core then refuses it when the conversation was
+                // closed or removed meanwhile, instead of taking it as the agent connecting anew.
+                let resumed_id = present(&params, "binding_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| {
+                        resume && !id.is_empty() && id.len() <= 200 && !id.starts_with("local-")
+                    })
+                    .map(str::to_owned);
                 let _state_transaction = self.conversation_state_serial.lock().await;
                 self.check_registration_allowed(&client_ref, resume).await?;
                 let existing = { self.bindings.lock().await.get(&client_ref).cloned() };
@@ -1229,9 +1251,15 @@ impl Daemon {
                     } else if previous_owner != owner {
                         bail!("binding belongs to another façade");
                     }
-                    let registered = self.register_core(&existing).await?;
-                    let binding_id = existing.id.lock().await.clone();
+                    let registered = self.register_core(&existing).await;
                     drop(_state_transaction);
+                    let registered = match registered {
+                        Err(error) if error.to_string() == "CORE_BINDING_CLOSED" => {
+                            return Err(self.close_refused_resume(&existing).await);
+                        }
+                        other => other?,
+                    };
+                    let binding_id = existing.id.lock().await.clone();
                     let mut answer = json!({"binding_id":binding_id,"thread":thread,"connected":self.link.connected().await,
                         "epoch":registered.get("epoch"),"initial_reply_context":registered.get("initial_reply_context")});
                     joined_way_in(&mut answer, &existing.state.lock().await.inbound);
@@ -1261,7 +1289,9 @@ impl Daemon {
                     state: Mutex::new(state),
                     detachable,
                     owner: AtomicU64::new(owner),
-                    id: Mutex::new(format!("local-{}", uuid::Uuid::new_v4())),
+                    id: Mutex::new(
+                        resumed_id.unwrap_or_else(|| format!("local-{}", uuid::Uuid::new_v4())),
+                    ),
                     serial: Mutex::new(()),
                     publication: Mutex::new(()),
                     turns: Mutex::new(HashMap::new()),
@@ -1279,9 +1309,15 @@ impl Daemon {
                     } else if previous_owner != owner {
                         bail!("binding belongs to another façade");
                     }
-                    let registered = self.register_core(&existing).await?;
-                    let binding_id = existing.id.lock().await.clone();
+                    let registered = self.register_core(&existing).await;
                     drop(_state_transaction);
+                    let registered = match registered {
+                        Err(error) if error.to_string() == "CORE_BINDING_CLOSED" => {
+                            return Err(self.close_refused_resume(&existing).await);
+                        }
+                        other => other?,
+                    };
+                    let binding_id = existing.id.lock().await.clone();
                     let mut answer = json!({"binding_id":binding_id,"thread":thread,
                         "connected":self.link.connected().await,
                         "epoch":registered.get("epoch"),"initial_reply_context":registered.get("initial_reply_context")});
@@ -1324,7 +1360,12 @@ impl Daemon {
                     bail!("explicit join could not be saved");
                 }
                 drop(_state_transaction);
-                let result = self.register_core(&binding).await;
+                let result = match self.register_core(&binding).await {
+                    Err(error) if error.to_string() == "CORE_BINDING_CLOSED" => {
+                        return Err(self.close_refused_resume(&binding).await);
+                    }
+                    other => other,
+                };
                 let id = binding.id.lock().await.clone();
                 if result.is_ok() {
                     self.request_replay();

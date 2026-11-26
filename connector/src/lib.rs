@@ -27,6 +27,7 @@ pub mod pairing;
 pub mod platform;
 pub mod private_dir;
 pub mod profile;
+mod rejoin;
 pub mod service;
 pub mod step;
 #[cfg(test)]
